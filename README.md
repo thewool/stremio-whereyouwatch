@@ -1,2 +1,2 @@
 # whereyouwatch
-whereyouwatch for stremio
+Whereyouwatch Catalog for Stremio
