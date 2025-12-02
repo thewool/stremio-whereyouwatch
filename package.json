@@ -1,0 +1,14 @@
+{
+  "name": "stremio-wyw-reports",
+  "version": "1.0.0",
+  "description": "Stremio addon for WhereYouWatch latest reports",
+  "main": "addon.js",
+  "scripts": {
+    "start": "node addon.js"
+  },
+  "dependencies": {
+    "stremio-addon-sdk": "^1.6.9",
+    "axios": "^1.6.2",
+    "cheerio": "^1.0.0-rc.12"
+  }
+}
