@@ -1,0 +1,2 @@
+# whereyouwatch
+whereyouwatch for stremio
