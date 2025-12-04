@@ -8,13 +8,18 @@ const BASE_URL = 'https://whereyouwatch.com/latest-reports/';
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
-// SETTINGS
-const MAX_ITEMS = 300; 
-const TARGET_PAGE_COUNT = 30; // 30 pages * ~10 items = ~300 items
+// --- NEW: OMDB API KEY ---
+// Get a free key at https://www.omdbapi.com/apikey.aspx
+const OMDB_API_KEY = ''; // <--- PASTE YOUR KEY HERE
+
+// INCREASED LIMITS: 
+// 120 days (approx 4 months) to ensure we get 300 items even if they are old
+const MAX_AGE_MS = 120 * 24 * 60 * 60 * 1000; 
+const MAX_ITEMS = 300;
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.1.2', 
+    version: '1.0.7', 
     name: 'WhereYouWatch Reports',
     description: 'Latest releases from WhereYouWatch.com',
     resources: ['catalog'],
@@ -41,11 +46,32 @@ function parseReleaseTitle(rawString) {
         const yearIndex = yearMatch.index;
         let title = rawString.substring(0, yearIndex).trim();
         title = title.replace(/\./g, ' ').replace(/_/g, ' ');
-        // Clean common prefixes/suffixes
-        title = title.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
         return { title: title, year: yearMatch[0] };
     }
     return { title: rawString, year: null };
+}
+
+function parseDate(dateString) {
+    if (!dateString) return Date.now();
+    const cleanDate = dateString.replace('Submitted on:', '').trim();
+    return new Date(cleanDate).getTime();
+}
+
+// --- NEW: Helper to fetch RT Rating ---
+async function getRtRating(imdbId) {
+    if (!OMDB_API_KEY) return null;
+    try {
+        // We use a short timeout so we don't slow down the scrape too much
+        const { data } = await axios.get(`http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&i=${imdbId}&tomatoes=true`, { timeout: 3000 });
+        if (data && data.Ratings) {
+            const rt = data.Ratings.find(r => r.Source === 'Rotten Tomatoes');
+            return rt ? rt.Value : null;
+        }
+    } catch (e) {
+        // Silently fail if OMDB is down or quota exceeded
+        return null;
+    }
+    return null;
 }
 
 async function resolveToImdb(title, year) {
@@ -62,115 +88,139 @@ async function resolveToImdb(title, year) {
 }
 
 async function scrapePages() {
-    console.log('--- STARTING SCRAPE (Correct ?pg= Pagination) ---');
-    lastStatus = "Scraping...";
+    console.log('--- STARTING SCRAPE (WhereYouWatch) ---');
+    lastStatus = "Scraping Page 1...";
     let allItems = [];
+    let keepFetching = true;
     let page = 1;
+    const cutoffDate = Date.now() - MAX_AGE_MS;
 
     try {
-        while (page <= TARGET_PAGE_COUNT) {
-            if (allItems.length >= MAX_ITEMS) break;
+        while (keepFetching) {
+            // Stop if we have enough items
+            if (allItems.length >= MAX_ITEMS) {
+                console.log(`> Reached target of ${MAX_ITEMS} items. Stopping.`);
+                break;
+            }
 
-            // CORRECTED URL CONSTRUCTION
-            // Page 1: https://whereyouwatch.com/latest-reports/
-            // Page 2: https://whereyouwatch.com/latest-reports/?pg=2
-            const url = page === 1 ? BASE_URL : `${BASE_URL}?pg=${page}`;
+            console.log(`> Fetching Page ${page}... (Current Count: ${allItems.length})`);
+            const url = page === 1 ? BASE_URL : `${BASE_URL}page/${page}/`;
             
-            console.log(`> Fetching Page ${page} [${url}]... (Total: ${allItems.length})`);
-
             try {
                 const response = await axios.get(url, { 
-                    headers: { 'User-Agent': USER_AGENT } 
+                    headers: { 
+                        'User-Agent': USER_AGENT,
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.9'
+                    } 
                 });
                 
                 const $ = cheerio.load(response.data);
                 let itemsFoundOnPage = 0;
 
-                // Selectors:
-                // .jrResourceTitle -> Featured/Top items
-                // .jrListingTitle -> Standard list items
-                // h2 a, h3 a -> General fallback
-                const candidates = $('.jrResourceTitle, .jrListingTitle, h2 a, h3 a, .entry-title');
-
-                candidates.each((i, el) => {
-                    if (allItems.length >= MAX_ITEMS) return false;
+                $('.jrResourceTitle').each((i, el) => {
+                    if (allItems.length >= MAX_ITEMS) {
+                        keepFetching = false;
+                        return false; 
+                    }
 
                     const rawTitle = $(el).text().trim();
-                    const href = $(el).attr('href') || $(el).parent().attr('href');
-
-                    // Validation: Must have Year
                     const hasYear = /\b(19|20)\d{2}\b/.test(rawTitle);
-                    const isJunk = rawTitle.includes("Guide") || rawTitle.includes("Register") || rawTitle.includes("Login");
+                    const hasQuality = /WEB|1080p|2160p|DVDRip|BluRay|HDRip|H\.264|H\.265/i.test(rawTitle);
 
-                    if (hasYear && !isJunk) {
-                        const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
-                        if (!alreadyAdded) {
-                            itemsFoundOnPage++;
-                            allItems.push({ rawTitle: rawTitle, link: href });
+                    if (hasYear && hasQuality) {
+                        let container = $(el).parent();
+                        let dateText = null;
+                        
+                        for (let k = 0; k < 4; k++) {
+                            const textToCheck = container.text();
+                            const match = textToCheck.match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
+                            if (match) { dateText = match; break; }
+                            
+                            const siblingMatch = container.nextAll().text().match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
+                            if (siblingMatch) { dateText = siblingMatch; break; }
+                            
+                            container = container.parent();
+                        }
+                        
+                        if (!dateText) {
+                             const nearHtml = $(el).parent().html() || "";
+                             dateText = nearHtml.match(/([A-Za-z]{3}\s\d{1,2},\s\d{4})/);
+                        }
+
+                        if (dateText) {
+                            const dateStr = Array.isArray(dateText) ? dateText[1] : dateText;
+                            const dateTs = parseDate(dateStr);
+                            
+                            const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
+                            
+                            if (!alreadyAdded) {
+                                if (dateTs < cutoffDate) {
+                                    keepFetching = false;
+                                    return false; 
+                                }
+                                itemsFoundOnPage++;
+                                allItems.push({ rawTitle: rawTitle, date: dateTs });
+                            }
                         }
                     }
                 });
 
-                console.log(`> Page ${page}: Found ${itemsFoundOnPage} items.`);
+                console.log(`> Page ${page}: Found ${itemsFoundOnPage} valid items.`);
 
-                // If a page returns 0 items, it might be the end of the list, or just a bad page.
-                // We'll give it 2 "strikes" before quitting.
-                if (itemsFoundOnPage === 0 && page > 1) {
-                     // Check if we are truly at the end (often redirect to home or 404)
-                     if (response.request.res.responseUrl && !response.request.res.responseUrl.includes('pg=')) {
-                        console.log("> Redirected to homepage. End of pagination.");
-                        break;
-                     }
+                if (itemsFoundOnPage === 0 && page > 1) keepFetching = false;
+                page++;
+                
+                if (keepFetching) await delay(1500); 
+                
+                if (page > 35) {
+                    keepFetching = false;
                 }
 
             } catch (err) {
                 console.error(`Error fetching page ${page}: ${err.message}`);
-                // 404 usually means end of pagination
-                if (err.response && err.response.status === 404) {
-                    console.log("> Reached 404. Stopping.");
-                    break;
-                }
+                keepFetching = false;
             }
-
-            page++;
-            await delay(1200); // Respectful delay
         }
 
-        console.log(`> Found ${allItems.length} raw items. Matching IMDb...`);
-        lastStatus = `Processing ${allItems.length} items...`;
+        console.log(`> Found ${allItems.length} reports. Matching IMDb & RT...`);
+        lastStatus = `Processing ${allItems.length} items (Fetching Ratings)...`;
         const newCatalog = [];
 
         for (const item of allItems) {
             const parsed = parseReleaseTitle(item.rawTitle);
-            
-            if (!parsed.title || parsed.title.length < 2) continue;
-            
             const imdbItem = await resolveToImdb(parsed.title, parsed.year);
 
             if (imdbItem) {
+                // --- NEW: Fetch RT Rating and Append ---
+                let displayName = imdbItem.name;
+                const rtRating = await getRtRating(imdbItem.id);
+                
+                if (rtRating) {
+                    displayName = `${imdbItem.name} ${rtRating}`;
+                }
+                // ----------------------------------------
+
                 newCatalog.push({
                     id: imdbItem.id,
                     type: 'movie',
-                    name: imdbItem.name,
+                    name: displayName, // Use the new name with suffix
                     poster: `https://images.metahub.space/poster/medium/${imdbItem.id}/img`,
-                    description: `Release: ${item.rawTitle}\nMatched: ${imdbItem.name}`,
+                    description: `Release: ${item.rawTitle}\nMatched: ${imdbItem.name}\nRotten Tomatoes: ${rtRating || 'N/A'}`,
                     releaseInfo: imdbItem.releaseInfo
                 });
             } else {
-                if (newCatalog.length < 300) {
-                    newCatalog.push({
-                        id: `wyw_${parsed.title.replace(/\s/g, '')}_${parsed.year || '0000'}`,
-                        type: 'movie',
-                        name: parsed.title,
-                        poster: null,
-                        description: `Unmatched Release: ${item.rawTitle}`,
-                        releaseInfo: parsed.year || '????'
-                    });
-                }
+                newCatalog.push({
+                    id: `wyw_${parsed.title.replace(/\s/g, '')}_${parsed.year || '0000'}`,
+                    type: 'movie',
+                    name: parsed.title,
+                    poster: null,
+                    description: `Unmatched Release: ${item.rawTitle}`,
+                    releaseInfo: parsed.year || '????'
+                });
             }
         }
 
-        // Deduplicate
         const uniqueCatalog = [];
         const seenIds = new Set();
         for (const item of newCatalog) {
@@ -213,5 +263,3 @@ serveHTTP(builder.getInterface(), { port: PORT });
 scrapePages();
 setInterval(scrapePages, 180 * 60 * 1000); 
 console.log(`Addon running on http://localhost:${PORT}`);
-
-
