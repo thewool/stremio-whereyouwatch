@@ -9,11 +9,12 @@ const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
 // SETTINGS
-const TARGET_PAGE_COUNT = 15; // FORCE scraper to read this many pages
+const TARGET_PAGE_COUNT = 15; // Scrape 15 pages
+const MAX_ITEMS = 300;
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.0.8', 
+    version: '1.0.9', 
     name: 'WhereYouWatch Reports',
     description: 'Latest releases from WhereYouWatch.com',
     resources: ['catalog'],
@@ -40,6 +41,8 @@ function parseReleaseTitle(rawString) {
         const yearIndex = yearMatch.index;
         let title = rawString.substring(0, yearIndex).trim();
         title = title.replace(/\./g, ' ').replace(/_/g, ' ');
+        // Clean up common suffix junk often found in raw text
+        title = title.replace(/Submitted on:/i, '').trim();
         return { title: title, year: yearMatch[0] };
     }
     return { title: rawString, year: null };
@@ -59,14 +62,15 @@ async function resolveToImdb(title, year) {
 }
 
 async function scrapePages() {
-    console.log('--- STARTING SCRAPE (WhereYouWatch) - FORCED MODE ---');
+    console.log('--- STARTING DEEP SCAN SCRAPE ---');
     lastStatus = "Scraping...";
     let allItems = [];
     let page = 1;
 
     try {
-        // FORCE loop to run for TARGET_PAGE_COUNT, ignoring errors or empty pages
         while (page <= TARGET_PAGE_COUNT) {
+            if (allItems.length >= MAX_ITEMS) break;
+
             console.log(`> Fetching Page ${page}... (Current Total: ${allItems.length})`);
             const url = page === 1 ? BASE_URL : `${BASE_URL}page/${page}/`;
             
@@ -78,44 +82,48 @@ async function scrapePages() {
                 const $ = cheerio.load(response.data);
                 let itemsFoundOnPage = 0;
 
-                // AGGRESSIVE SELECTOR: jrResourceTitle is the specific one, others are fallbacks
-                $('.jrResourceTitle, .jrListingTitle, td strong').each((i, el) => {
+                // --- DEEP SCAN STRATEGY ---
+                // Select ALL elements that might contain text
+                $('div, span, strong, b, h1, h2, h3, h4, a, td').each((i, el) => {
+                    // Only look at "Leaf Nodes" (elements with no children) to avoid duplicates
+                    if ($(el).children().length > 0) return;
+
                     const rawTitle = $(el).text().trim();
                     
-                    // Simple Validation: Must contain a year
+                    // Filter: Must look like a movie title with a Year
                     const hasYear = /\b(19|20)\d{2}\b/.test(rawTitle);
-                    const isLongEnough = rawTitle.length > 5;
+                    const isLongEnough = rawTitle.length > 5 && rawTitle.length < 100; // avoid huge paragraphs
+                    const notMetadata = !rawTitle.includes("Submitted on") && !rawTitle.includes("Written by");
 
-                    if (hasYear && isLongEnough) {
+                    if (hasYear && isLongEnough && notMetadata) {
                         const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
                         if (!alreadyAdded) {
                             itemsFoundOnPage++;
-                            // We aren't filtering by date anymore to ensure we get results
                             allItems.push({ rawTitle: rawTitle });
                         }
                     }
                 });
 
-                console.log(`> Page ${page}: Found ${itemsFoundOnPage} items.`);
-
-                // removed the "if items == 0 then stop" logic. 
-                // We keep going just in case Page 2 is weird but Page 3 is fine.
+                console.log(`> Page ${page}: Found ${itemsFoundOnPage} candidates.`);
 
             } catch (err) {
                 console.error(`Error fetching page ${page}: ${err.message}`);
-                // Don't stop on error, just try next page
             }
 
             page++;
-            await delay(1000); // 1 second pause between pages
+            await delay(1500); 
         }
 
-        console.log(`> Found ${allItems.length} reports total. Matching IMDb...`);
+        console.log(`> Found ${allItems.length} raw items. Matching IMDb...`);
         lastStatus = `Processing ${allItems.length} items...`;
         const newCatalog = [];
 
         for (const item of allItems) {
             const parsed = parseReleaseTitle(item.rawTitle);
+            
+            // Skip bad parses
+            if (!parsed.title || parsed.title.length < 2) continue;
+
             const imdbItem = await resolveToImdb(parsed.title, parsed.year);
 
             if (imdbItem) {
@@ -128,14 +136,17 @@ async function scrapePages() {
                     releaseInfo: imdbItem.releaseInfo
                 });
             } else {
-                newCatalog.push({
-                    id: `wyw_${parsed.title.replace(/\s/g, '')}_${parsed.year || '0000'}`,
-                    type: 'movie',
-                    name: parsed.title,
-                    poster: null,
-                    description: `Unmatched Release: ${item.rawTitle}`,
-                    releaseInfo: parsed.year || '????'
-                });
+                // Limit unmatched items to avoid cluttering the catalog with garbage text
+                if (newCatalog.length < 300) {
+                    newCatalog.push({
+                        id: `wyw_${parsed.title.replace(/\s/g, '')}_${parsed.year || '0000'}`,
+                        type: 'movie',
+                        name: parsed.title,
+                        poster: null,
+                        description: `Unmatched Release: ${item.rawTitle}`,
+                        releaseInfo: parsed.year || '????'
+                    });
+                }
             }
         }
 
