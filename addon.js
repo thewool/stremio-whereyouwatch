@@ -8,20 +8,20 @@ const BASE_URL = 'https://whereyouwatch.com/latest-reports/';
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
-// --- NEW: OMDB API KEY ---
+// --- OMDB API KEY ---
 // Get a free key at https://www.omdbapi.com/apikey.aspx
 const OMDB_API_KEY = 'a8924bd9'; // <--- PASTE YOUR KEY HERE
 
-// INCREASED LIMITS: 
+// --- RESTORED LIMITS (Yesterday's Stable Logic) ---
 // 120 days (approx 4 months) to ensure we get 300 items even if they are old
 const MAX_AGE_MS = 120 * 24 * 60 * 60 * 1000; 
 const MAX_ITEMS = 300;
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.0.7', 
+    version: '1.0.9', 
     name: 'WhereYouWatch Reports',
-    description: 'Latest releases from WhereYouWatch.com',
+    description: 'Latest releases (Top 300) from WhereYouWatch.com',
     resources: ['catalog'],
     types: ['movie'],
     catalogs: [
@@ -57,18 +57,16 @@ function parseDate(dateString) {
     return new Date(cleanDate).getTime();
 }
 
-// --- NEW: Helper to fetch RT Rating ---
+// --- Helper to fetch RT Rating ---
 async function getRtRating(imdbId) {
     if (!OMDB_API_KEY) return null;
     try {
-        // We use a short timeout so we don't slow down the scrape too much
         const { data } = await axios.get(`http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&i=${imdbId}&tomatoes=true`, { timeout: 3000 });
         if (data && data.Ratings) {
             const rt = data.Ratings.find(r => r.Source === 'Rotten Tomatoes');
             return rt ? rt.Value : null;
         }
     } catch (e) {
-        // Silently fail if OMDB is down or quota exceeded
         return null;
     }
     return null;
@@ -156,6 +154,8 @@ async function scrapePages() {
                             
                             if (!alreadyAdded) {
                                 if (dateTs < cutoffDate) {
+                                    // With specific limits, we usually want to stop here as we reached old content
+                                    console.log(`> Reached time limit: ${dateStr}`);
                                     keepFetching = false;
                                     return false; 
                                 }
@@ -168,12 +168,17 @@ async function scrapePages() {
 
                 console.log(`> Page ${page}: Found ${itemsFoundOnPage} valid items.`);
 
-                if (itemsFoundOnPage === 0 && page > 1) keepFetching = false;
+                if (itemsFoundOnPage === 0 && page > 1) {
+                    keepFetching = false;
+                }
+                
                 page++;
                 
                 if (keepFetching) await delay(1500); 
                 
+                // Safety limit from "Yesterday"
                 if (page > 35) {
+                    console.log("> Reached page safety limit (35). Stopping.");
                     keepFetching = false;
                 }
 
@@ -192,19 +197,17 @@ async function scrapePages() {
             const imdbItem = await resolveToImdb(parsed.title, parsed.year);
 
             if (imdbItem) {
-                // --- NEW: Fetch RT Rating and Append ---
                 let displayName = imdbItem.name;
                 const rtRating = await getRtRating(imdbItem.id);
                 
                 if (rtRating) {
                     displayName = `${imdbItem.name} ${rtRating}`;
                 }
-                // ----------------------------------------
 
                 newCatalog.push({
                     id: imdbItem.id,
                     type: 'movie',
-                    name: displayName, // Use the new name with suffix
+                    name: displayName,
                     poster: `https://images.metahub.space/poster/medium/${imdbItem.id}/img`,
                     description: `Release: ${item.rawTitle}\nMatched: ${imdbItem.name}\nRotten Tomatoes: ${rtRating || 'N/A'}`,
                     releaseInfo: imdbItem.releaseInfo
@@ -261,5 +264,5 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 
 serveHTTP(builder.getInterface(), { port: PORT });
 scrapePages();
-setInterval(scrapePages, 180 * 60 * 1000); 
+setInterval(scrapePages, 180 * 60 * 1000); // 3 Hours refresh
 console.log(`Addon running on http://localhost:${PORT}`);
