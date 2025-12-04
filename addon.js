@@ -18,7 +18,7 @@ const TARGET_PAGE_COUNT = 30;
 
 const manifest = {
     id: 'org.whereyouwatch.reports.rt',
-    version: '1.2.3', 
+    version: '1.2.4', 
     name: 'WhereYouWatch + Ratings',
     description: 'Latest releases with cached RT/IMDb/Metacritic',
     resources: ['catalog'],
@@ -72,7 +72,9 @@ function parseReleaseTitle(rawString) {
         title = title.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
         return { title: title, year: yearMatch[0] };
     }
-    return { title: rawString, year: null };
+    // If no year found, try to clean the title anyway for better matching
+    let cleanTitle = rawString.replace(/[\._]/g, ' ').trim();
+    return { title: cleanTitle, year: null };
 }
 
 // Helper: Try to resolve movie via OMDB directly if Cinemeta fails
@@ -80,11 +82,24 @@ async function resolveViaOmdb(title, year) {
     if (!OMDB_API_KEY || OMDB_API_KEY.includes('YOUR_OMDB')) return null;
     
     try {
-        // Construct query: t=Title&y=Year
+        // 1. Try Strict Search: t=Title&y=Year
         let queryUrl = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&t=${encodeURIComponent(title)}`;
         if (year) queryUrl += `&y=${year}`;
 
-        const { data } = await axios.get(queryUrl);
+        let { data } = await axios.get(queryUrl);
+
+        // 2. Fallback: If strict search fails and we had a year, try WITHOUT year
+        // (Fixes cases where Scene Release is 2024 but OMDB has 2023)
+        if (year && (!data || data.Response === 'False')) {
+            // console.log(`> Strict search failed for ${title} (${year}). Trying loose search...`);
+            const looseUrl = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&t=${encodeURIComponent(title)}`;
+            const looseRes = await axios.get(looseUrl);
+            
+            // Only accept if valid and relatively recent (sanity check)
+            if (looseRes.data && looseRes.data.Response === 'True') {
+                 data = looseRes.data;
+            }
+        }
 
         if (data && data.Response === 'True' && data.imdbID) {
             // Found it! Let's extract and cache the rating immediately to save a call later
@@ -163,7 +178,7 @@ async function resolveToImdb(title, year) {
 }
 
 async function scrapePages() {
-    console.log('--- STARTING SCRAPE (v1.2.3) ---');
+    console.log('--- STARTING SCRAPE (v1.2.4) ---');
     lastStatus = "Scraping...";
     let allItems = [];
     let page = 1;
