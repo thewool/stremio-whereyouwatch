@@ -8,7 +8,7 @@ const path = require('path');
 const PORT = process.env.PORT || 7000;
 const BASE_URL = 'https://whereyouwatch.com/latest-reports/';
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
-const OMDB_API_KEY = 'a8924bd9'; // <--- MUST BE VALID FREE KEY
+const OMDB_API_KEY = 'a8924bd9'; 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 const CACHE_FILE = path.join(__dirname, 'omdb_ratings_cache.json');
 
@@ -18,7 +18,7 @@ const TARGET_PAGE_COUNT = 30;
 
 const manifest = {
     id: 'org.whereyouwatch.reports.rt',
-    version: '1.2.4', 
+    version: '1.2.6', 
     name: 'WhereYouWatch + Ratings',
     description: 'Latest releases with cached RT/IMDb/Metacritic',
     resources: ['catalog'],
@@ -72,37 +72,79 @@ function parseReleaseTitle(rawString) {
         title = title.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
         return { title: title, year: yearMatch[0] };
     }
-    // If no year found, try to clean the title anyway for better matching
     let cleanTitle = rawString.replace(/[\._]/g, ' ').trim();
     return { title: cleanTitle, year: null };
+}
+
+// --- NEW: DIRECT ROTTEN TOMATOES FETCH ---
+async function fetchRottenTomatoesDirect(title, year) {
+    try {
+        // Use RT's internal search API
+        const url = `https://www.rottentomatoes.com/napi/search/all?query=${encodeURIComponent(title)}&limit=5`;
+        const { data } = await axios.get(url, { 
+            headers: { 'User-Agent': USER_AGENT } // Essential to avoid blocking
+        });
+
+        if (data && data.movie && data.movie.items && data.movie.items.length > 0) {
+            // Find the best match
+            const match = data.movie.items.find(m => {
+                // If year is provided, allow a 1-year variance (2024 vs 2025)
+                if (year && m.releaseYear) {
+                    const diff = Math.abs(parseInt(m.releaseYear) - parseInt(year));
+                    return diff <= 1;
+                }
+                return true; // Match first if no year
+            });
+
+            if (match && match.tomatometerScore && match.tomatometerScore.score) {
+                // console.log(`> 🍅 RT Direct Hit: ${match.name} -> ${match.tomatometerScore.score}%`);
+                return {
+                    type: 'RT',
+                    value: `${match.tomatometerScore.score}%`,
+                    source: 'Direct'
+                };
+            }
+        }
+    } catch (e) {
+        // console.error(`! RT Direct Error: ${e.message}`);
+    }
+    return null;
 }
 
 // Helper: Try to resolve movie via OMDB directly if Cinemeta fails
 async function resolveViaOmdb(title, year) {
     if (!OMDB_API_KEY || OMDB_API_KEY.includes('YOUR_OMDB')) return null;
-    
+    const cleanTitle = title.replace(/\./g, ' ').trim();
+
     try {
-        // 1. Try Strict Search: t=Title&y=Year
-        let queryUrl = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&t=${encodeURIComponent(title)}`;
+        // 1. Strict Search
+        let queryUrl = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&t=${encodeURIComponent(cleanTitle)}&plot=full`;
         if (year) queryUrl += `&y=${year}`;
 
         let { data } = await axios.get(queryUrl);
 
-        // 2. Fallback: If strict search fails and we had a year, try WITHOUT year
-        // (Fixes cases where Scene Release is 2024 but OMDB has 2023)
+        // 2. Loose Search (No Year)
         if (year && (!data || data.Response === 'False')) {
-            // console.log(`> Strict search failed for ${title} (${year}). Trying loose search...`);
-            const looseUrl = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&t=${encodeURIComponent(title)}`;
+            const looseUrl = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&t=${encodeURIComponent(cleanTitle)}&plot=full`;
             const looseRes = await axios.get(looseUrl);
-            
-            // Only accept if valid and relatively recent (sanity check)
-            if (looseRes.data && looseRes.data.Response === 'True') {
-                 data = looseRes.data;
-            }
+            if (looseRes.data && looseRes.data.Response === 'True') data = looseRes.data;
+        }
+
+        // 3. Search Fallback (s=Title)
+        if (!data || data.Response === 'False') {
+             const searchUrl = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&s=${encodeURIComponent(cleanTitle)}`;
+             const searchRes = await axios.get(searchUrl);
+             
+             if (searchRes.data && searchRes.data.Search && searchRes.data.Search.length > 0) {
+                 const firstId = searchRes.data.Search[0].imdbID;
+                 const detailUrl = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&i=${firstId}&plot=full`;
+                 const detailRes = await axios.get(detailUrl);
+                 if (detailRes.data && detailRes.data.Response === 'True') data = detailRes.data;
+             }
         }
 
         if (data && data.Response === 'True' && data.imdbID) {
-            // Found it! Let's extract and cache the rating immediately to save a call later
+            // Cache ratings if found
             let result = null;
             if (data.Ratings) {
                 const rt = data.Ratings.find(r => r.Source === "Rotten Tomatoes");
@@ -113,16 +155,15 @@ async function resolveViaOmdb(title, year) {
 
             if (result) ratingsCache[data.imdbID] = result;
 
-            // Return structure matching Cinemeta's format
             return {
                 id: data.imdbID,
                 name: data.Title,
-                releaseInfo: data.Year
+                releaseInfo: data.Year,
+                poster: (data.Poster && data.Poster !== "N/A") ? data.Poster : null,
+                plot: (data.Plot && data.Plot !== "N/A") ? data.Plot : null
             };
         }
-    } catch(e) {
-        // Silent fail
-    }
+    } catch(e) {}
     return null;
 }
 
@@ -153,8 +194,6 @@ async function getRating(imdbId) {
 
 async function resolveToImdb(title, year) {
     if (!title) return null;
-    
-    // Strategy 1: Cinemeta Strict Search
     try {
         if (year) {
             const query = `${title} ${year}`;
@@ -163,8 +202,6 @@ async function resolveToImdb(title, year) {
             if (data && data.metas && data.metas.length > 0) return data.metas[0];
         }
     } catch (e) {}
-
-    // Strategy 2: Cinemeta Loose Search
     try {
         const url = `${CINEMETA_URL}/search=${encodeURIComponent(title)}.json`;
         const { data } = await axios.get(url);
@@ -173,12 +210,11 @@ async function resolveToImdb(title, year) {
             if (match.releaseInfo && parseInt(match.releaseInfo) > 2000) return match;
         }
     } catch (e) {}
-
     return null;
 }
 
 async function scrapePages() {
-    console.log('--- STARTING SCRAPE (v1.2.4) ---');
+    console.log('--- STARTING SCRAPE (v1.2.6) ---');
     lastStatus = "Scraping...";
     let allItems = [];
     let page = 1;
@@ -224,19 +260,26 @@ async function scrapePages() {
         for (const item of allItems) {
             const parsed = parseReleaseTitle(item.rawTitle);
             
-            // 1. Try resolving via Cinemeta (Standard)
             let imdbItem = await resolveToImdb(parsed.title, parsed.year);
 
-            // 2. If Cinemeta failed, try resolving via OMDB (Fallback for new movies)
             if (!imdbItem) {
-                // console.log(`> Cinemeta miss for "${parsed.title}". Trying OMDB...`);
                 imdbItem = await resolveViaOmdb(parsed.title, parsed.year);
             }
 
             if (imdbItem) {
-                // Fetch Rating
-                const ratingData = await getRating(imdbItem.id);
+                // 1. Get OMDB Rating
+                let ratingData = await getRating(imdbItem.id);
                 
+                // 2. If OMDB has no RT score, try Direct RT Fetch
+                if (!ratingData || ratingData.type !== 'RT') {
+                    const rtDirect = await fetchRottenTomatoesDirect(parsed.title, parsed.year);
+                    if (rtDirect) {
+                        ratingData = rtDirect;
+                        // Cache this found score so we don't spam RT next time
+                        ratingsCache[imdbItem.id] = rtDirect; 
+                    }
+                }
+
                 let namePrefix = '';
                 let descScore = 'Ratings: N/A (Too new?)';
 
@@ -253,17 +296,19 @@ async function scrapePages() {
                     }
                 }
 
+                const plotText = imdbItem.plot ? `\n\n${imdbItem.plot}` : '';
+                const posterUrl = imdbItem.poster || `https://images.metahub.space/poster/medium/${imdbItem.id}/img`;
+
                 newCatalog.push({
                     id: imdbItem.id,
                     type: 'movie',
                     name: `${namePrefix}${imdbItem.name}`,
-                    poster: `https://images.metahub.space/poster/medium/${imdbItem.id}/img`,
-                    description: `${descScore}\nrelease: ${item.rawTitle}`,
+                    poster: posterUrl,
+                    description: `${descScore}\nrelease: ${item.rawTitle}${plotText}`,
                     releaseInfo: imdbItem.releaseInfo,
                     behaviorHints: { defaultVideoId: imdbItem.id }
                 });
             } else {
-                // UNMATCHED ITEM
                 newCatalog.push({
                     id: `wyw_${parsed.title.replace(/[^a-zA-Z0-9]/g, '')}`,
                     type: 'movie',
@@ -273,16 +318,14 @@ async function scrapePages() {
                     releaseInfo: parsed.year || '????'
                 });
             }
-            await delay(20); 
+            await delay(50); // Slight delay to respect rate limits
         }
 
-        // Save Cache if updated
         if (Object.keys(ratingsCache).length > initialCacheSize) {
             newRatingsFound = true;
             saveCache();
         }
 
-        // Deduplicate
         const seen = new Set();
         movieCatalog = newCatalog.filter(item => {
             const duplicate = seen.has(item.id);
@@ -299,7 +342,6 @@ async function scrapePages() {
     }
 }
 
-// Initialize Cache
 loadCache();
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
