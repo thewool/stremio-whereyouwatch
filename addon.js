@@ -4,17 +4,18 @@ const cheerio = require('cheerio');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 7000;
-const BASE_URL = 'https://whereyouwatch.com/latest-reports/';
+// CHANGED: Switched to root URL to ensure pagination works
+const BASE_URL = 'https://whereyouwatch.com/'; 
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
 // SETTINGS
-const TARGET_PAGE_COUNT = 15; // Scrape 15 pages
+const TARGET_PAGE_COUNT = 25; // Scrape 25 pages to ensure we get 300+ items
 const MAX_ITEMS = 300;
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.0.9', 
+    version: '1.1.0', 
     name: 'WhereYouWatch Reports',
     description: 'Latest releases from WhereYouWatch.com',
     resources: ['catalog'],
@@ -41,8 +42,8 @@ function parseReleaseTitle(rawString) {
         const yearIndex = yearMatch.index;
         let title = rawString.substring(0, yearIndex).trim();
         title = title.replace(/\./g, ' ').replace(/_/g, ' ');
-        // Clean up common suffix junk often found in raw text
-        title = title.replace(/Submitted on:/i, '').trim();
+        // Clean up common suffix junk
+        title = title.replace(/Submitted on:/i, '').replace(/Posted by:/i, '').trim();
         return { title: title, year: yearMatch[0] };
     }
     return { title: rawString, year: null };
@@ -62,7 +63,7 @@ async function resolveToImdb(title, year) {
 }
 
 async function scrapePages() {
-    console.log('--- STARTING DEEP SCAN SCRAPE ---');
+    console.log('--- STARTING HOMEPAGE FEED SCRAPE ---');
     lastStatus = "Scraping...";
     let allItems = [];
     let page = 1;
@@ -72,6 +73,7 @@ async function scrapePages() {
             if (allItems.length >= MAX_ITEMS) break;
 
             console.log(`> Fetching Page ${page}... (Current Total: ${allItems.length})`);
+            // Standard WordPress pagination pattern on the homepage
             const url = page === 1 ? BASE_URL : `${BASE_URL}page/${page}/`;
             
             try {
@@ -82,20 +84,31 @@ async function scrapePages() {
                 const $ = cheerio.load(response.data);
                 let itemsFoundOnPage = 0;
 
-                // --- DEEP SCAN STRATEGY ---
-                // Select ALL elements that might contain text
-                $('div, span, strong, b, h1, h2, h3, h4, a, td').each((i, el) => {
-                    // Only look at "Leaf Nodes" (elements with no children) to avoid duplicates
-                    if ($(el).children().length > 0) return;
+                // --- SMART BLOCK SCANNER ---
+                // Instead of looking for titles directly, we look for "Article" or "Entry" containers
+                // Common WP classes: .post, .article, .entry, .type-post
+                $('.post, article, .entry, .type-post, .jrListing').each((i, el) => {
+                    if (allItems.length >= MAX_ITEMS) return false;
 
-                    const rawTitle = $(el).text().trim();
+                    // Get the FULL text of the card (Title + Date + Desc)
+                    // This fixes issues where "Movie Name" and "2024" are in different divs
+                    const fullText = $(el).text().replace(/\s+/g, ' ').trim();
                     
-                    // Filter: Must look like a movie title with a Year
-                    const hasYear = /\b(19|20)\d{2}\b/.test(rawTitle);
-                    const isLongEnough = rawTitle.length > 5 && rawTitle.length < 100; // avoid huge paragraphs
-                    const notMetadata = !rawTitle.includes("Submitted on") && !rawTitle.includes("Written by");
+                    // We need to extract the title line specifically if possible
+                    // Usually the title is in an h2, h3 or h4 tag inside the card
+                    let titleText = $(el).find('h1, h2, h3, h4, .jrResourceTitle, .entry-title').first().text().trim();
+                    
+                    // Fallback: If no heading found, use the full text but truncate it
+                    if (!titleText) titleText = fullText.substring(0, 100);
 
-                    if (hasYear && isLongEnough && notMetadata) {
+                    // Check if it's a valid movie release (Must have Year)
+                    const hasYear = /\b(19|20)\d{2}\b/.test(titleText) || /\b(19|20)\d{2}\b/.test(fullText);
+                    
+                    if (hasYear) {
+                        // If the Heading didn't have the year, but the body did, grab the body text
+                        // but prefer the heading for cleaner titles
+                        const rawTitle = /\b(19|20)\d{2}\b/.test(titleText) ? titleText : fullText.substring(0, 100);
+
                         const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
                         if (!alreadyAdded) {
                             itemsFoundOnPage++;
@@ -104,10 +117,29 @@ async function scrapePages() {
                     }
                 });
 
-                console.log(`> Page ${page}: Found ${itemsFoundOnPage} candidates.`);
+                // Fallback: If generic containers failed, try the old "Link Scan" but on the homepage
+                if (itemsFoundOnPage === 0) {
+                     $('a').each((i, el) => {
+                        const txt = $(el).text().trim();
+                        if (/\b(19|20)\d{2}\b/.test(txt) && txt.length > 5 && txt.length < 100) {
+                            const alreadyAdded = allItems.some(item => item.rawTitle === txt);
+                            if (!alreadyAdded) {
+                                itemsFoundOnPage++;
+                                allItems.push({ rawTitle: txt });
+                            }
+                        }
+                     });
+                }
+
+                console.log(`> Page ${page}: Found ${itemsFoundOnPage} items.`);
 
             } catch (err) {
                 console.error(`Error fetching page ${page}: ${err.message}`);
+                // If 404, we likely reached the end of pagination
+                if (err.response && err.response.status === 404) {
+                    console.log("> Reached end of content (404). Stopping.");
+                    break;
+                }
             }
 
             page++;
@@ -121,8 +153,9 @@ async function scrapePages() {
         for (const item of allItems) {
             const parsed = parseReleaseTitle(item.rawTitle);
             
-            // Skip bad parses
+            // Skip invalid junk
             if (!parsed.title || parsed.title.length < 2) continue;
+            if (parsed.title.includes("Search") || parsed.title.includes("Menu")) continue;
 
             const imdbItem = await resolveToImdb(parsed.title, parsed.year);
 
@@ -136,7 +169,7 @@ async function scrapePages() {
                     releaseInfo: imdbItem.releaseInfo
                 });
             } else {
-                // Limit unmatched items to avoid cluttering the catalog with garbage text
+                // Keep unmatched items but limited count
                 if (newCatalog.length < 300) {
                     newCatalog.push({
                         id: `wyw_${parsed.title.replace(/\s/g, '')}_${parsed.year || '0000'}`,
