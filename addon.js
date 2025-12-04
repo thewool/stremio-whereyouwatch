@@ -13,7 +13,7 @@ const MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000;
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.0.2', 
+    version: '1.0.3', // Bumped version for tracking
     name: 'WhereYouWatch Reports',
     description: 'Latest releases from WhereYouWatch.com (Last 2 Months)',
     resources: ['catalog'],
@@ -87,7 +87,6 @@ async function scrapePages() {
                 
                 const $ = cheerio.load(response.data);
                 
-                // --- DEBUGGING LOGS ---
                 if (page === 1) {
                     const pageTitle = $('title').text().trim();
                     console.log(`> [DEBUG] Page Title: "${pageTitle}"`);
@@ -96,11 +95,19 @@ async function scrapePages() {
                 }
                 
                 let itemsFoundOnPage = 0;
+                let debugLinkCounter = 0;
 
-                // CHANGED: Use a broad selector for all links, as headers are missing
                 $('a').each((i, el) => {
                     const rawTitle = $(el).text().trim();
                     
+                    // --- NEW DEBUGGING LOGIC ---
+                    // Print the first 15 links found to see what we are dealing with
+                    if (page === 1 && debugLinkCounter < 15 && rawTitle.length > 0) {
+                        console.log(`> [DEBUG] Link: "${rawTitle}"`);
+                        debugLinkCounter++;
+                    }
+                    // ---------------------------
+
                     // Filter: Must have a Year (19xx or 20xx)
                     const hasYear = /\b(19|20)\d{2}\b/.test(rawTitle);
                     
@@ -108,7 +115,6 @@ async function scrapePages() {
                     const hasQuality = /WEB|1080p|2160p|DVDRip|BluRay|HDRip|H\.264|H\.265/i.test(rawTitle);
 
                     if (hasYear && hasQuality) {
-                        // Traverse up the DOM to find the date (Container -> Parent -> Grandparent)
                         let container = $(el).parent();
                         let dateText = null;
                         
@@ -120,7 +126,6 @@ async function scrapePages() {
                                 dateText = match;
                                 break;
                             }
-                            // Also try finding it in siblings if the structure is flat
                             const siblingMatch = container.nextAll().text().match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
                             if (siblingMatch) {
                                 dateText = siblingMatch;
@@ -129,7 +134,6 @@ async function scrapePages() {
                             container = container.parent();
                         }
                         
-                        // Fallback: If date not found, try to find ANY date pattern nearby
                         if (!dateText) {
                              const nearHtml = $(el).parent().html() || "";
                              dateText = nearHtml.match(/([A-Za-z]{3}\s\d{1,2},\s\d{4})/);
@@ -139,14 +143,13 @@ async function scrapePages() {
                             const dateStr = Array.isArray(dateText) ? dateText[1] : dateText;
                             const dateTs = parseDate(dateStr);
                             
-                            // Prevent duplicates in the same loop
                             const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
                             
                             if (!alreadyAdded) {
                                 if (dateTs < cutoffDate) {
                                     console.log(`> Reached limit: ${dateStr}`);
                                     keepFetching = false;
-                                    return false; // Break cheerio loop
+                                    return false; 
                                 }
                                 itemsFoundOnPage++;
                                 allItems.push({ rawTitle: rawTitle, date: dateTs });
@@ -160,7 +163,7 @@ async function scrapePages() {
                 if (itemsFoundOnPage === 0 && page > 1) keepFetching = false;
                 page++;
                 if (keepFetching) await delay(2000);
-                if (page > 10) keepFetching = false; // Reduced page limit to save resources during debug
+                if (page > 10) keepFetching = false;
 
             } catch (err) {
                 console.error(`Error fetching page ${page}: ${err.message}`);
