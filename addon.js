@@ -6,7 +6,7 @@ const cheerio = require('cheerio');
 const PORT = process.env.PORT || 7000;
 const BASE_URL = 'https://whereyouwatch.com/latest-reports/';
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
-const OMDB_API_KEY = 'a8924bd9'; // <--- GET FREE KEY AT omdbapi.com
+const OMDB_API_KEY = 'YOUR_OMDB_KEY_HERE'; // <--- GET FREE KEY AT omdbapi.com
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
 // SETTINGS
@@ -49,17 +49,24 @@ function parseReleaseTitle(rawString) {
     return { title: rawString, year: null };
 }
 
-// Helper to fetch RT Score from OMDB
-async function getRtScore(imdbId) {
+// Helper to fetch RT Score from OMDB (With IMDb Fallback)
+async function getRating(imdbId) {
     if (!OMDB_API_KEY || OMDB_API_KEY === 'YOUR_OMDB_KEY_HERE') return null;
     try {
         const url = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&i=${imdbId}`;
         const { data } = await axios.get(url);
         
+        // 1. Try Rotten Tomatoes
         if (data && data.Ratings) {
             const rt = data.Ratings.find(r => r.Source === "Rotten Tomatoes");
-            return rt ? rt.Value : null;
+            if (rt) return { type: 'RT', value: rt.Value };
         }
+
+        // 2. Fallback to IMDb
+        if (data && data.imdbRating && data.imdbRating !== "N/A") {
+            return { type: 'IMDb', value: data.imdbRating };
+        }
+
     } catch (e) {
         // Silent fail on rating fetch to keep process moving
         return null;
@@ -147,16 +154,28 @@ async function scrapePages() {
             const imdbItem = await resolveToImdb(parsed.title, parsed.year);
 
             if (imdbItem) {
-                // Fetch RT Score here
-                const rtScore = await getRtScore(imdbItem.id);
-                const scorePrefix = rtScore ? `🍅 ${rtScore} ` : '';
+                // Fetch Rating (RT or IMDb fallback)
+                const ratingData = await getRating(imdbItem.id);
+                
+                let scorePrefix = '';
+                let descScore = 'Ratings: N/A';
+
+                if (ratingData) {
+                    if (ratingData.type === 'RT') {
+                        scorePrefix = `🍅 ${ratingData.value} `;
+                        descScore = `Rotten Tomatoes: ${ratingData.value}`;
+                    } else if (ratingData.type === 'IMDb') {
+                        scorePrefix = `⭐ ${ratingData.value} `;
+                        descScore = `IMDb: ${ratingData.value}`;
+                    }
+                }
 
                 newCatalog.push({
                     id: imdbItem.id,
                     type: 'movie',
                     name: `${scorePrefix}${imdbItem.name}`, // Add Score to Name
                     poster: `https://images.metahub.space/poster/medium/${imdbItem.id}/img`,
-                    description: `Rotten Tomatoes: ${rtScore || 'N/A'}\nRelease: ${item.rawTitle}`,
+                    description: `${descScore}\nRelease: ${item.rawTitle}`,
                     releaseInfo: imdbItem.releaseInfo
                 });
             } else {
