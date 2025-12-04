@@ -18,7 +18,7 @@ const TARGET_PAGE_COUNT = 30;
 
 const manifest = {
     id: 'org.whereyouwatch.reports.rt',
-    version: '1.2.2', 
+    version: '1.2.3', 
     name: 'WhereYouWatch + Ratings',
     description: 'Latest releases with cached RT/IMDb/Metacritic',
     resources: ['catalog'],
@@ -39,7 +39,6 @@ let lastStatus = "Initializing...";
 let ratingsCache = {};
 
 // --- CACHE SYSTEM ---
-// This prevents hitting the OMDB API limit (1000 requests/day)
 function loadCache() {
     try {
         if (fs.existsSync(CACHE_FILE)) {
@@ -68,20 +67,53 @@ function parseReleaseTitle(rawString) {
     if (yearMatch) {
         const yearIndex = yearMatch.index;
         let title = rawString.substring(0, yearIndex).trim();
-        title = title.replace(/\./g, ' ').replace(/_/g, ' ');
+        // Clean dots/underscores and ensure single spaces
+        title = title.replace(/[\._]/g, ' ').replace(/\s+/g, ' ').trim();
         title = title.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
         return { title: title, year: yearMatch[0] };
     }
     return { title: rawString, year: null };
 }
 
+// Helper: Try to resolve movie via OMDB directly if Cinemeta fails
+async function resolveViaOmdb(title, year) {
+    if (!OMDB_API_KEY || OMDB_API_KEY.includes('YOUR_OMDB')) return null;
+    
+    try {
+        // Construct query: t=Title&y=Year
+        let queryUrl = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&t=${encodeURIComponent(title)}`;
+        if (year) queryUrl += `&y=${year}`;
+
+        const { data } = await axios.get(queryUrl);
+
+        if (data && data.Response === 'True' && data.imdbID) {
+            // Found it! Let's extract and cache the rating immediately to save a call later
+            let result = null;
+            if (data.Ratings) {
+                const rt = data.Ratings.find(r => r.Source === "Rotten Tomatoes");
+                if (rt) result = { type: 'RT', value: rt.Value };
+            }
+            if (!result && data.Metascore && data.Metascore !== "N/A") result = { type: 'Meta', value: data.Metascore };
+            if (!result && data.imdbRating && data.imdbRating !== "N/A") result = { type: 'IMDb', value: data.imdbRating };
+
+            if (result) ratingsCache[data.imdbID] = result;
+
+            // Return structure matching Cinemeta's format
+            return {
+                id: data.imdbID,
+                name: data.Title,
+                releaseInfo: data.Year
+            };
+        }
+    } catch(e) {
+        // Silent fail
+    }
+    return null;
+}
+
 // Helper to fetch Scores from OMDB (RT -> Metacritic -> IMDb)
 async function getRating(imdbId) {
-    // 1. Check Cache First
-    if (ratingsCache[imdbId]) {
-        return ratingsCache[imdbId];
-    }
-
+    if (ratingsCache[imdbId]) return ratingsCache[imdbId];
     if (!OMDB_API_KEY || OMDB_API_KEY.includes('YOUR_OMDB')) return null;
 
     try {
@@ -91,62 +123,39 @@ async function getRating(imdbId) {
         if (!data || data.Response === 'False') return null;
 
         let result = null;
-
-        // 1. Try Rotten Tomatoes
         if (data.Ratings) {
             const rt = data.Ratings.find(r => r.Source === "Rotten Tomatoes");
             if (rt) result = { type: 'RT', value: rt.Value };
         }
+        if (!result && data.Metascore && data.Metascore !== "N/A") result = { type: 'Meta', value: data.Metascore };
+        if (!result && data.imdbRating && data.imdbRating !== "N/A") result = { type: 'IMDb', value: data.imdbRating };
 
-        // 2. Try Metacritic (Often updates faster than RT on free API)
-        if (!result && data.Metascore && data.Metascore !== "N/A") {
-            result = { type: 'Meta', value: data.Metascore };
-        }
-
-        // 3. Fallback to IMDb
-        if (!result && data.imdbRating && data.imdbRating !== "N/A") {
-            result = { type: 'IMDb', value: data.imdbRating };
-        }
-
-        // Save to memory cache if we found something
-        if (result) {
-            ratingsCache[imdbId] = result;
-        }
-
+        if (result) ratingsCache[imdbId] = result;
         return result;
 
-    } catch (e) {
-        // Silent fail for network errors to keep scraper running
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
 async function resolveToImdb(title, year) {
     if (!title) return null;
     
-    // Strategy 1: Strict Search (Title + Year)
+    // Strategy 1: Cinemeta Strict Search
     try {
         if (year) {
             const query = `${title} ${year}`;
             const url = `${CINEMETA_URL}/search=${encodeURIComponent(query)}.json`;
             const { data } = await axios.get(url);
-            if (data && data.metas && data.metas.length > 0) {
-                return data.metas[0];
-            }
+            if (data && data.metas && data.metas.length > 0) return data.metas[0];
         }
     } catch (e) {}
 
-    // Strategy 2: Loose Search (Title Only) - Fixes issues where release year != metadata year
+    // Strategy 2: Cinemeta Loose Search
     try {
         const url = `${CINEMETA_URL}/search=${encodeURIComponent(title)}.json`;
         const { data } = await axios.get(url);
         if (data && data.metas && data.metas.length > 0) {
-            // Verify it's somewhat recent to avoid matching a 1950s movie with same name
             const match = data.metas[0];
-            if (match.releaseInfo && parseInt(match.releaseInfo) > 2000) {
-                // console.log(`> Loose match found for "${title}": ${match.name} (${match.releaseInfo})`);
-                return match;
-            }
+            if (match.releaseInfo && parseInt(match.releaseInfo) > 2000) return match;
         }
     } catch (e) {}
 
@@ -154,7 +163,7 @@ async function resolveToImdb(title, year) {
 }
 
 async function scrapePages() {
-    console.log('--- STARTING SCRAPE (v1.2.2) ---');
+    console.log('--- STARTING SCRAPE (v1.2.3) ---');
     lastStatus = "Scraping...";
     let allItems = [];
     let page = 1;
@@ -163,7 +172,6 @@ async function scrapePages() {
         // --- 1. HARVEST LINKS ---
         while (page <= TARGET_PAGE_COUNT) {
             if (allItems.length >= MAX_ITEMS) break;
-
             const url = page === 1 ? BASE_URL : `${BASE_URL}?pg=${page}`;
             console.log(`> Fetching Page ${page}...`);
 
@@ -184,9 +192,7 @@ async function scrapePages() {
                         }
                     }
                 });
-
                 if (itemsFoundOnPage === 0 && page > 1) break;
-
             } catch (err) { break; }
             
             page++;
@@ -203,8 +209,14 @@ async function scrapePages() {
         for (const item of allItems) {
             const parsed = parseReleaseTitle(item.rawTitle);
             
-            // Resolve IMDb
-            const imdbItem = await resolveToImdb(parsed.title, parsed.year);
+            // 1. Try resolving via Cinemeta (Standard)
+            let imdbItem = await resolveToImdb(parsed.title, parsed.year);
+
+            // 2. If Cinemeta failed, try resolving via OMDB (Fallback for new movies)
+            if (!imdbItem) {
+                // console.log(`> Cinemeta miss for "${parsed.title}". Trying OMDB...`);
+                imdbItem = await resolveViaOmdb(parsed.title, parsed.year);
+            }
 
             if (imdbItem) {
                 // Fetch Rating
@@ -246,11 +258,10 @@ async function scrapePages() {
                     releaseInfo: parsed.year || '????'
                 });
             }
-            // Faster delay if we are just hitting cache
             await delay(20); 
         }
 
-        // Save Cache if we found new stuff
+        // Save Cache if updated
         if (Object.keys(ratingsCache).length > initialCacheSize) {
             newRatingsFound = true;
             saveCache();
