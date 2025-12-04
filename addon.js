@@ -9,17 +9,15 @@ const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
 // --- OMDB API KEY ---
-// Get a free key at https://www.omdbapi.com/apikey.aspx
 const OMDB_API_KEY = 'a8924bd9'; // <--- PASTE YOUR KEY HERE
 
-// --- RESTORED LIMITS (Yesterday's Stable Logic) ---
-// 120 days (approx 4 months) to ensure we get 300 items even if they are old
-const MAX_AGE_MS = 120 * 24 * 60 * 60 * 1000; 
+// LIMITS
+const MAX_AGE_MS = 120 * 24 * 60 * 60 * 1000; // 120 Days
 const MAX_ITEMS = 300;
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.0.9', 
+    version: '1.1.0', 
     name: 'WhereYouWatch Reports',
     description: 'Latest releases (Top 300) from WhereYouWatch.com',
     resources: ['catalog'],
@@ -57,7 +55,6 @@ function parseDate(dateString) {
     return new Date(cleanDate).getTime();
 }
 
-// --- Helper to fetch RT Rating ---
 async function getRtRating(imdbId) {
     if (!OMDB_API_KEY) return null;
     try {
@@ -95,7 +92,6 @@ async function scrapePages() {
 
     try {
         while (keepFetching) {
-            // Stop if we have enough items
             if (allItems.length >= MAX_ITEMS) {
                 console.log(`> Reached target of ${MAX_ITEMS} items. Stopping.`);
                 break;
@@ -114,7 +110,14 @@ async function scrapePages() {
                 });
                 
                 const $ = cheerio.load(response.data);
+                
+                // --- FIX: DETECT RAW ELEMENTS ---
+                // We count how many raw titles exist BEFORE filtering. 
+                // If this is 0, the page is truly empty.
+                const totalElementsOnPage = $('.jrResourceTitle').length;
                 let itemsFoundOnPage = 0;
+
+                console.log(`> [DEBUG] Page ${page} contains ${totalElementsOnPage} raw elements.`);
 
                 $('.jrResourceTitle').each((i, el) => {
                     if (allItems.length >= MAX_ITEMS) {
@@ -134,10 +137,8 @@ async function scrapePages() {
                             const textToCheck = container.text();
                             const match = textToCheck.match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
                             if (match) { dateText = match; break; }
-                            
                             const siblingMatch = container.nextAll().text().match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
                             if (siblingMatch) { dateText = siblingMatch; break; }
-                            
                             container = container.parent();
                         }
                         
@@ -149,13 +150,15 @@ async function scrapePages() {
                         if (dateText) {
                             const dateStr = Array.isArray(dateText) ? dateText[1] : dateText;
                             const dateTs = parseDate(dateStr);
-                            
                             const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
                             
                             if (!alreadyAdded) {
                                 if (dateTs < cutoffDate) {
-                                    // With specific limits, we usually want to stop here as we reached old content
-                                    console.log(`> Reached time limit: ${dateStr}`);
+                                    // Soft stop: if we hit an old date, we just stop processing this item.
+                                    // But we rely on the main loop to decide when to fully quit to avoid
+                                    // stopping on a single "sticky" old post.
+                                    // For now, let's keep strict stop but log it.
+                                    console.log(`> Reached time limit on: ${rawTitle} (${dateStr})`);
                                     keepFetching = false;
                                     return false; 
                                 }
@@ -166,25 +169,31 @@ async function scrapePages() {
                     }
                 });
 
-                console.log(`> Page ${page}: Found ${itemsFoundOnPage} valid items.`);
+                console.log(`> Page ${page}: Added ${itemsFoundOnPage} valid items.`);
 
-                if (itemsFoundOnPage === 0 && page > 1) {
+                // --- FIX: BETTER STOP CONDITION ---
+                // Only stop if the page has NO ELEMENTS at all. 
+                // If it had elements but we filtered them all out (e.g. they were all TV shows), continue!
+                if (totalElementsOnPage === 0 && page > 1) {
+                    console.log("> Page is empty. End of catalog.");
                     keepFetching = false;
                 }
                 
                 page++;
-                
                 if (keepFetching) await delay(1500); 
                 
-                // Safety limit from "Yesterday"
-                if (page > 35) {
-                    console.log("> Reached page safety limit (35). Stopping.");
+                // Safety: Stop if we go ridiculously high
+                if (page > 50) {
+                    console.log("> Reached page safety limit (50). Stopping.");
                     keepFetching = false;
                 }
 
             } catch (err) {
                 console.error(`Error fetching page ${page}: ${err.message}`);
-                keepFetching = false;
+                // 404 means end of pagination
+                if (err.response && err.response.status === 404) {
+                    keepFetching = false;
+                }
             }
         }
 
@@ -264,5 +273,5 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 
 serveHTTP(builder.getInterface(), { port: PORT });
 scrapePages();
-setInterval(scrapePages, 180 * 60 * 1000); // 3 Hours refresh
+setInterval(scrapePages, 180 * 60 * 1000); 
 console.log(`Addon running on http://localhost:${PORT}`);
