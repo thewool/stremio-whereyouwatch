@@ -4,18 +4,16 @@ const cheerio = require('cheerio');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 7000;
-// CHANGED: Switched to root URL to ensure pagination works
-const BASE_URL = 'https://whereyouwatch.com/'; 
+const START_URL = 'https://whereyouwatch.com/latest-reports/'; 
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
 // SETTINGS
-const TARGET_PAGE_COUNT = 25; // Scrape 25 pages to ensure we get 300+ items
-const MAX_ITEMS = 300;
+const MAX_ITEMS = 300; // Target catalog size
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.1.0', 
+    version: '1.1.1', 
     name: 'WhereYouWatch Reports',
     description: 'Latest releases from WhereYouWatch.com',
     resources: ['catalog'],
@@ -42,8 +40,8 @@ function parseReleaseTitle(rawString) {
         const yearIndex = yearMatch.index;
         let title = rawString.substring(0, yearIndex).trim();
         title = title.replace(/\./g, ' ').replace(/_/g, ' ');
-        // Clean up common suffix junk
-        title = title.replace(/Submitted on:/i, '').replace(/Posted by:/i, '').trim();
+        // Clean common prefixes/suffixes
+        title = title.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
         return { title: title, year: yearMatch[0] };
     }
     return { title: rawString, year: null };
@@ -63,87 +61,89 @@ async function resolveToImdb(title, year) {
 }
 
 async function scrapePages() {
-    console.log('--- STARTING HOMEPAGE FEED SCRAPE ---');
+    console.log('--- STARTING SCRAPE (Smart Pagination) ---');
     lastStatus = "Scraping...";
     let allItems = [];
-    let page = 1;
+    let nextUrl = START_URL;
+    let pageCount = 1;
 
     try {
-        while (page <= TARGET_PAGE_COUNT) {
-            if (allItems.length >= MAX_ITEMS) break;
-
-            console.log(`> Fetching Page ${page}... (Current Total: ${allItems.length})`);
-            // Standard WordPress pagination pattern on the homepage
-            const url = page === 1 ? BASE_URL : `${BASE_URL}page/${page}/`;
+        while (nextUrl && allItems.length < MAX_ITEMS && pageCount <= 25) {
+            console.log(`> Fetching Page ${pageCount} [${nextUrl}]... (Total: ${allItems.length})`);
             
             try {
-                const response = await axios.get(url, { 
+                const response = await axios.get(nextUrl, { 
                     headers: { 'User-Agent': USER_AGENT } 
                 });
                 
                 const $ = cheerio.load(response.data);
                 let itemsFoundOnPage = 0;
 
-                // --- SMART BLOCK SCANNER ---
-                // Instead of looking for titles directly, we look for "Article" or "Entry" containers
-                // Common WP classes: .post, .article, .entry, .type-post
-                $('.post, article, .entry, .type-post, .jrListing').each((i, el) => {
+                // 1. SELECTOR STRATEGY
+                // We search for multiple common classes.
+                // .jrResourceTitle = Featured items (usually top 5)
+                // .jrListingTitle = Standard items (the long list)
+                // .entry-title = Generic fallback
+                const candidates = $('.jrResourceTitle, .jrListingTitle, .entry-title, h2 a, h3 a');
+
+                candidates.each((i, el) => {
                     if (allItems.length >= MAX_ITEMS) return false;
 
-                    // Get the FULL text of the card (Title + Date + Desc)
-                    // This fixes issues where "Movie Name" and "2024" are in different divs
-                    const fullText = $(el).text().replace(/\s+/g, ' ').trim();
-                    
-                    // We need to extract the title line specifically if possible
-                    // Usually the title is in an h2, h3 or h4 tag inside the card
-                    let titleText = $(el).find('h1, h2, h3, h4, .jrResourceTitle, .entry-title').first().text().trim();
-                    
-                    // Fallback: If no heading found, use the full text but truncate it
-                    if (!titleText) titleText = fullText.substring(0, 100);
+                    const rawTitle = $(el).text().trim();
+                    const href = $(el).attr('href') || $(el).parent().attr('href');
 
-                    // Check if it's a valid movie release (Must have Year)
-                    const hasYear = /\b(19|20)\d{2}\b/.test(titleText) || /\b(19|20)\d{2}\b/.test(fullText);
-                    
-                    if (hasYear) {
-                        // If the Heading didn't have the year, but the body did, grab the body text
-                        // but prefer the heading for cleaner titles
-                        const rawTitle = /\b(19|20)\d{2}\b/.test(titleText) ? titleText : fullText.substring(0, 100);
+                    // Filter: Must have Year
+                    const hasYear = /\b(19|20)\d{2}\b/.test(rawTitle);
+                    // Filter: Must NOT be site metadata
+                    const isJunk = rawTitle.includes("Guide") || rawTitle.includes("Register") || rawTitle.includes("Login");
 
+                    if (hasYear && !isJunk) {
                         const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
                         if (!alreadyAdded) {
                             itemsFoundOnPage++;
-                            allItems.push({ rawTitle: rawTitle });
+                            allItems.push({ rawTitle: rawTitle, link: href });
                         }
                     }
                 });
 
-                // Fallback: If generic containers failed, try the old "Link Scan" but on the homepage
-                if (itemsFoundOnPage === 0) {
-                     $('a').each((i, el) => {
-                        const txt = $(el).text().trim();
-                        if (/\b(19|20)\d{2}\b/.test(txt) && txt.length > 5 && txt.length < 100) {
-                            const alreadyAdded = allItems.some(item => item.rawTitle === txt);
-                            if (!alreadyAdded) {
-                                itemsFoundOnPage++;
-                                allItems.push({ rawTitle: txt });
-                            }
+                console.log(`> Page ${pageCount}: Found ${itemsFoundOnPage} items.`);
+
+                // 2. PAGINATION STRATEGY
+                // Find the "Next" button dynamically to ensure we get the right URL
+                const nextLink = $('a.next, a.jr_next, a:contains("Next"), a:contains("›")').last();
+                
+                if (nextLink.length > 0) {
+                    let nextHref = nextLink.attr('href');
+                    // Handle relative URLs
+                    if (nextHref && !nextHref.startsWith('http')) {
+                        if (nextHref.startsWith('/')) {
+                            nextUrl = 'https://whereyouwatch.com' + nextHref;
+                        } else {
+                            nextUrl = nextUrl.replace(/\/[^\/]*$/, '/') + nextHref;
                         }
-                     });
+                    } else {
+                        nextUrl = nextHref;
+                    }
+                    console.log(`> Next Page detected: ${nextUrl}`);
+                } else {
+                    console.log("> No 'Next' button found. Attempting manual URL increment.");
+                    // Fallback if button is hidden: try manual increment
+                    nextUrl = `${START_URL}page/${pageCount + 1}/`;
                 }
 
-                console.log(`> Page ${page}: Found ${itemsFoundOnPage} items.`);
-
-            } catch (err) {
-                console.error(`Error fetching page ${page}: ${err.message}`);
-                // If 404, we likely reached the end of pagination
-                if (err.response && err.response.status === 404) {
-                    console.log("> Reached end of content (404). Stopping.");
+                // If page was empty, stop manual increment loop to prevent infinite 404s
+                if (itemsFoundOnPage === 0 && pageCount > 1) {
+                    console.log("> Empty page. Stopping.");
                     break;
                 }
+
+            } catch (err) {
+                console.error(`Error fetching page ${pageCount}: ${err.message}`);
+                break;
             }
 
-            page++;
-            await delay(1500); 
+            pageCount++;
+            await delay(1500);
         }
 
         console.log(`> Found ${allItems.length} raw items. Matching IMDb...`);
@@ -153,10 +153,9 @@ async function scrapePages() {
         for (const item of allItems) {
             const parsed = parseReleaseTitle(item.rawTitle);
             
-            // Skip invalid junk
+            // Validity Check
             if (!parsed.title || parsed.title.length < 2) continue;
-            if (parsed.title.includes("Search") || parsed.title.includes("Menu")) continue;
-
+            
             const imdbItem = await resolveToImdb(parsed.title, parsed.year);
 
             if (imdbItem) {
@@ -169,7 +168,6 @@ async function scrapePages() {
                     releaseInfo: imdbItem.releaseInfo
                 });
             } else {
-                // Keep unmatched items but limited count
                 if (newCatalog.length < 300) {
                     newCatalog.push({
                         id: `wyw_${parsed.title.replace(/\s/g, '')}_${parsed.year || '0000'}`,
