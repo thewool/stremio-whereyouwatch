@@ -18,7 +18,7 @@ const TARGET_PAGE_COUNT = 30;
 
 const manifest = {
     id: 'org.whereyouwatch.reports.rt',
-    version: '1.2.6', 
+    version: '1.2.7', 
     name: 'WhereYouWatch + Ratings',
     description: 'Latest releases with cached RT/IMDb/Metacritic',
     resources: ['catalog'],
@@ -76,34 +76,39 @@ function parseReleaseTitle(rawString) {
     return { title: cleanTitle, year: null };
 }
 
-// --- NEW: DIRECT ROTTEN TOMATOES FETCH ---
+// --- NEW: ROBUST ROTTEN TOMATOES FETCH ---
 async function fetchRottenTomatoesDirect(title, year) {
     try {
-        // Use RT's internal search API
-        const url = `https://www.rottentomatoes.com/napi/search/all?query=${encodeURIComponent(title)}&limit=5`;
-        const { data } = await axios.get(url, { 
-            headers: { 'User-Agent': USER_AGENT } // Essential to avoid blocking
-        });
+        // Strategy: Try searching just the Title first. 
+        // If that fails (e.g. "Troll 2" returns the 1990 movie), try "Title Year" ("Troll 2 2025")
+        let searchQueries = [title];
+        if (year) searchQueries.push(`${title} ${year}`);
 
-        if (data && data.movie && data.movie.items && data.movie.items.length > 0) {
-            // Find the best match
-            const match = data.movie.items.find(m => {
-                // If year is provided, allow a 1-year variance (2024 vs 2025)
-                if (year && m.releaseYear) {
-                    const diff = Math.abs(parseInt(m.releaseYear) - parseInt(year));
-                    return diff <= 1;
-                }
-                return true; // Match first if no year
+        for (const query of searchQueries) {
+            // console.log(`> 🍅 RT Search: "${query}"...`);
+            const url = `https://www.rottentomatoes.com/napi/search/all?query=${encodeURIComponent(query)}&limit=10`;
+            const { data } = await axios.get(url, { 
+                headers: { 'User-Agent': USER_AGENT } 
             });
 
-            if (match && match.tomatometerScore && match.tomatometerScore.score) {
-                // console.log(`> 🍅 RT Direct Hit: ${match.name} -> ${match.tomatometerScore.score}%`);
-                return {
-                    type: 'RT',
-                    value: `${match.tomatometerScore.score}%`,
-                    source: 'Direct'
-                };
+            if (data && data.movie && data.movie.items && data.movie.items.length > 0) {
+                const match = data.movie.items.find(m => {
+                    if (year && m.releaseYear) {
+                        const diff = Math.abs(parseInt(m.releaseYear) - parseInt(year));
+                        return diff <= 1; // Allow 2024/2025 variance
+                    }
+                    return true;
+                });
+
+                if (match && match.tomatometerScore && match.tomatometerScore.score) {
+                    return {
+                        type: 'RT',
+                        value: `${match.tomatometerScore.score}%`,
+                        source: 'Direct'
+                    };
+                }
             }
+            await delay(200); // Be polite between retries
         }
     } catch (e) {
         // console.error(`! RT Direct Error: ${e.message}`);
@@ -214,7 +219,7 @@ async function resolveToImdb(title, year) {
 }
 
 async function scrapePages() {
-    console.log('--- STARTING SCRAPE (v1.2.6) ---');
+    console.log('--- STARTING SCRAPE (v1.2.7) ---');
     lastStatus = "Scraping...";
     let allItems = [];
     let page = 1;
@@ -275,7 +280,6 @@ async function scrapePages() {
                     const rtDirect = await fetchRottenTomatoesDirect(parsed.title, parsed.year);
                     if (rtDirect) {
                         ratingData = rtDirect;
-                        // Cache this found score so we don't spam RT next time
                         ratingsCache[imdbItem.id] = rtDirect; 
                     }
                 }
@@ -318,7 +322,7 @@ async function scrapePages() {
                     releaseInfo: parsed.year || '????'
                 });
             }
-            await delay(50); // Slight delay to respect rate limits
+            await delay(50); 
         }
 
         if (Object.keys(ratingsCache).length > initialCacheSize) {
