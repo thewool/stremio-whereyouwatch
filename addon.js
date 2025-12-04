@@ -1,8 +1,9 @@
 const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
 const axios = require('axios');
 const cheerio = require('cheerio');
+const express = require('express');
+const app = express();
 
-// --- CONFIGURATION ---
 const PORT = process.env.PORT || 7000;
 const BASE_URL = 'https://whereyouwatch.com/latest-reports/';
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
@@ -10,229 +11,133 @@ const OMDB_API_KEY = 'a8924bd9'; // <--- MUST BE VALID FREE KEY
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
 // SETTINGS
-const MAX_ITEMS = 300; 
-const TARGET_PAGE_COUNT = 30; 
+const MAX_ITEMS = 300;
+const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
 
-const manifest = {
-    id: 'org.whereyouwatch.reports.rt',
-    version: '1.2.1', 
-    name: 'WhereYouWatch + Ratings',
-    description: 'Latest releases with RT/IMDb/Metacritic',
+// In-memory cache
+let movieCache = {
+    timestamp: 0,
+    data: []
+};
+
+// ID Mapping Cache (Title -> IMDB ID)
+const idCache = new Map();
+
+const builder = new addonBuilder({
+    id: 'org.rottentomatoes.feed',
+    version: '1.0.0',
+    name: 'Rotten Tomatoes / Metacritic Feed',
+    description: 'Scrapes latest reports and ratings.',
     resources: ['catalog'],
     types: ['movie'],
     catalogs: [
         {
             type: 'movie',
-            id: 'wyw_reports_rt',
-            name: 'WhereYouWatch RT',
-            extra: [{ name: 'skip' }]
+            id: 'rt_latest',
+            name: 'RT Latest Reports',
+            extra: [{ name: 'search', isRequired: false }]
         }
     ]
-};
+});
 
-const builder = new addonBuilder(manifest);
-let movieCatalog = [];
-let lastStatus = "Initializing...";
-
-const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-function parseReleaseTitle(rawString) {
-    const yearMatch = rawString.match(/(19|20)\d{2}/);
-    if (yearMatch) {
-        const yearIndex = yearMatch.index;
-        let title = rawString.substring(0, yearIndex).trim();
-        title = title.replace(/\./g, ' ').replace(/_/g, ' ');
-        title = title.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
-        return { title: title, year: yearMatch[0] };
-    }
-    return { title: rawString, year: null };
+// Helper: Clean title for better matching
+function cleanTitle(title) {
+    return title.replace(/\(\d{4}\)/, '').trim();
 }
 
-// Helper to fetch Scores from OMDB (RT -> Metacritic -> IMDb)
-async function getRating(imdbId) {
-    if (!OMDB_API_KEY || OMDB_API_KEY.includes('YOUR_OMDB')) return null;
+// Helper: Get IMDB ID from OMDB
+async function getImdbId(title, year = null) {
+    const cacheKey = `${title}-${year || ''}`;
+    if (idCache.has(cacheKey)) return idCache.get(cacheKey);
+
     try {
-        const url = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&i=${imdbId}`;
-        const { data } = await axios.get(url);
+        const url = `https://www.omdbapi.com/?t=${encodeURIComponent(title)}&apikey=${OMDB_API_KEY}${year ? `&y=${year}` : ''}`;
+        const response = await axios.get(url);
         
-        if (!data) return null;
-
-        // 1. Try Rotten Tomatoes
-        if (data.Ratings) {
-            const rt = data.Ratings.find(r => r.Source === "Rotten Tomatoes");
-            if (rt) return { type: 'RT', value: rt.Value };
+        if (response.data && response.data.imdbID) {
+            idCache.set(cacheKey, response.data.imdbID);
+            return response.data.imdbID;
         }
-
-        // 2. Try Metacritic (Often updates faster than RT on free API)
-        if (data.Metascore && data.Metascore !== "N/A") {
-            return { type: 'Meta', value: data.Metascore };
-        }
-
-        // 3. Fallback to IMDb
-        if (data.imdbRating && data.imdbRating !== "N/A") {
-            return { type: 'IMDb', value: data.imdbRating };
-        }
-
-    } catch (e) {
-        return null;
+    } catch (error) {
+        console.error(`OMDB Error for ${title}:`, error.message);
     }
     return null;
 }
 
-async function resolveToImdb(title, year) {
-    if (!title) return null;
-    
-    // Strategy 1: Strict Search (Title + Year)
+// Scraper Function
+async function scrapeMovies() {
+    const now = Date.now();
+    if (movieCache.data.length > 0 && (now - movieCache.timestamp < CACHE_DURATION)) {
+        console.log('Serving from cache');
+        return movieCache.data;
+    }
+
+    console.log('Scraping fresh data...');
     try {
-        if (year) {
-            const query = `${title} ${year}`;
-            const url = `${CINEMETA_URL}/search=${encodeURIComponent(query)}.json`;
-            const { data } = await axios.get(url);
-            if (data && data.metas && data.metas.length > 0) {
-                return data.metas[0];
-            }
-        }
-    } catch (e) {}
-
-    // Strategy 2: Loose Search (Title Only) - Fixes issues where release year != metadata year
-    try {
-        const url = `${CINEMETA_URL}/search=${encodeURIComponent(title)}.json`;
-        const { data } = await axios.get(url);
-        if (data && data.metas && data.metas.length > 0) {
-            // Verify it's somewhat recent to avoid matching a 1950s movie with same name
-            const match = data.metas[0];
-            if (match.releaseInfo && parseInt(match.releaseInfo) > 2000) {
-                console.log(`> Loose match found for "${title}": ${match.name} (${match.releaseInfo})`);
-                return match;
-            }
-        }
-    } catch (e) {}
-
-    return null;
-}
-
-async function scrapePages() {
-    console.log('--- STARTING SCRAPE (v1.2.1) ---');
-    lastStatus = "Scraping...";
-    let allItems = [];
-    let page = 1;
-
-    try {
-        // --- 1. HARVEST LINKS ---
-        while (page <= TARGET_PAGE_COUNT) {
-            if (allItems.length >= MAX_ITEMS) break;
-
-            const url = page === 1 ? BASE_URL : `${BASE_URL}?pg=${page}`;
-            console.log(`> Fetching Page ${page}...`);
-
-            try {
-                const response = await axios.get(url, { headers: { 'User-Agent': USER_AGENT } });
-                const $ = cheerio.load(response.data);
-                let itemsFoundOnPage = 0;
-
-                $('.jrResourceTitle, .jrListingTitle, h2 a, h3 a').each((i, el) => {
-                    if (allItems.length >= MAX_ITEMS) return false;
-                    const rawTitle = $(el).text().trim();
-                    const href = $(el).attr('href');
-                    
-                    if (rawTitle && /\b(19|20)\d{2}\b/.test(rawTitle) && !rawTitle.includes("Guide")) {
-                        if (!allItems.some(item => item.rawTitle === rawTitle)) {
-                            allItems.push({ rawTitle, link: href });
-                            itemsFoundOnPage++;
-                        }
-                    }
-                });
-
-                if (itemsFoundOnPage === 0 && page > 1) break;
-
-            } catch (err) { break; }
-            
-            page++;
-            await delay(800);
-        }
-
-        // --- 2. MATCH METADATA ---
-        console.log(`> Processing ${allItems.length} items with Ratings...`);
-        lastStatus = `Rating ${allItems.length} items...`;
-        const newCatalog = [];
-
-        for (const item of allItems) {
-            const parsed = parseReleaseTitle(item.rawTitle);
-            
-            // Resolve IMDb
-            const imdbItem = await resolveToImdb(parsed.title, parsed.year);
-
-            if (imdbItem) {
-                // Fetch Rating
-                const ratingData = await getRating(imdbItem.id);
-                
-                let namePrefix = '';
-                let descScore = 'Ratings: N/A (Too new?)';
-
-                if (ratingData) {
-                    if (ratingData.type === 'RT') {
-                        namePrefix = `🍅 ${ratingData.value} `;
-                        descScore = `Rotten Tomatoes: ${ratingData.value}`;
-                    } else if (ratingData.type === 'Meta') {
-                        namePrefix = `Ⓜ️ ${ratingData.value} `;
-                        descScore = `Metacritic: ${ratingData.value}`;
-                    } else if (ratingData.type === 'IMDb') {
-                        namePrefix = `⭐ ${ratingData.value} `;
-                        descScore = `IMDb: ${ratingData.value}`;
-                    }
-                }
-
-                newCatalog.push({
-                    id: imdbItem.id,
-                    type: 'movie',
-                    name: `${namePrefix}${imdbItem.name}`,
-                    poster: `https://images.metahub.space/poster/medium/${imdbItem.id}/img`,
-                    description: `${descScore}\nrelease: ${item.rawTitle}`,
-                    releaseInfo: imdbItem.releaseInfo
-                });
-            } else {
-                // UNMATCHED ITEM
-                newCatalog.push({
-                    id: `wyw_${parsed.title.replace(/\s/g, '')}`,
-                    type: 'movie',
-                    name: parsed.title,
-                    description: `Unmatched: ${item.rawTitle}`,
-                    poster: null,
-                    releaseInfo: parsed.year || '????'
-                });
-            }
-            await delay(50); // Be nice to OMDB
-        }
-
-        // Deduplicate
-        const seen = new Set();
-        movieCatalog = newCatalog.filter(item => {
-            const duplicate = seen.has(item.id);
-            seen.add(item.id);
-            return !duplicate;
+        const { data } = await axios.get(BASE_URL, {
+            headers: { 'User-Agent': USER_AGENT }
         });
+        
+        const $ = cheerio.load(data);
+        const movies = [];
+        
+        // Note: Selectors depend on the specific HTML structure of whereyouwatch.com
+        // This is a generic robust selector strategy for blog-roll style sites
+        const articles = $('article, .post, .entry'); 
+        
+        for (let i = 0; i < articles.length && movies.length < MAX_ITEMS; i++) {
+            const el = articles[i];
+            const titleRaw = $(el).find('h2, h3, .entry-title').first().text().trim();
+            
+            // Extract Year if present in title (e.g., "Movie Name (2024)")
+            const yearMatch = titleRaw.match(/\((\d{4})\)/);
+            const year = yearMatch ? yearMatch[1] : null;
+            const title = cleanTitle(titleRaw);
 
-        lastStatus = "Ready";
-        console.log(`> Update Complete. Size: ${movieCatalog.length}`);
+            // Extract Rating/Score if available
+            const score = $(el).find('.score, .rating, .grade').text().trim() || '';
+            const description = $(el).find('p, .excerpt').first().text().trim();
+            const poster = $(el).find('img').attr('src');
+
+            if (title) {
+                // Get IMDB ID
+                const imdbId = await getImdbId(title, year);
+                
+                if (imdbId) {
+                    movies.push({
+                        id: imdbId,
+                        type: 'movie',
+                        name: title,
+                        poster: poster,
+                        description: `RT/Meta Score: ${score}\n\n${description}`,
+                        releaseInfo: year || 'N/A'
+                    });
+                }
+            }
+        }
+
+        movieCache = {
+            timestamp: now,
+            data: movies
+        };
+        
+        return movies;
 
     } catch (error) {
-        console.error('! Error:', error.message);
-        lastStatus = "Error: " + error.message;
+        console.error('Scraping failed:', error.message);
+        return movieCache.data; // Return stale data if scrape fails
     }
 }
 
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
-    if (movieCatalog.length === 0) {
-        return { metas: [{ id: 'tt_status', type: 'movie', name: `Status: ${lastStatus}`, description: "Fetching..." }] };
-    }
-    if (type === 'movie' && id === 'wyw_reports_rt') {
-        const skip = extra.skip ? parseInt(extra.skip) : 0;
-        return { metas: movieCatalog.slice(skip, skip + 100) };
+    if (type === 'movie' && id === 'rt_latest') {
+        const movies = await scrapeMovies();
+        return { metas: movies };
     }
     return { metas: [] };
 });
 
+// Start Server
 serveHTTP(builder.getInterface(), { port: PORT });
-scrapePages();
-setInterval(scrapePages, 180 * 60 * 1000); 
-console.log(`Running on http://localhost:${PORT}`);
+console.log(`Addon active on port ${PORT}`);
+console.log(`Open http://localhost:${PORT}/manifest.json in Stremio`);
