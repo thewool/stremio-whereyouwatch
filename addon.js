@@ -8,14 +8,16 @@ const BASE_URL = 'https://whereyouwatch.com/latest-reports/';
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
-// 60 days in milliseconds
-const MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000; 
+// INCREASED LIMITS: 
+// 120 days (approx 4 months) to ensure we get 300 items even if they are old
+const MAX_AGE_MS = 120 * 24 * 60 * 60 * 1000; 
+const MAX_ITEMS = 300;
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.0.5', 
+    version: '1.0.6', 
     name: 'WhereYouWatch Reports',
-    description: 'Latest releases from WhereYouWatch.com (Last 2 Months)',
+    description: 'Latest releases from WhereYouWatch.com',
     resources: ['catalog'],
     types: ['movie'],
     catalogs: [
@@ -74,8 +76,15 @@ async function scrapePages() {
 
     try {
         while (keepFetching) {
-            console.log(`> Fetching Page ${page}...`);
+            // Stop if we have enough items
+            if (allItems.length >= MAX_ITEMS) {
+                console.log(`> Reached target of ${MAX_ITEMS} items. Stopping.`);
+                break;
+            }
+
+            console.log(`> Fetching Page ${page}... (Current Count: ${allItems.length})`);
             const url = page === 1 ? BASE_URL : `${BASE_URL}page/${page}/`;
+            
             try {
                 const response = await axios.get(url, { 
                     headers: { 
@@ -86,18 +95,21 @@ async function scrapePages() {
                 });
                 
                 const $ = cheerio.load(response.data);
-                
                 let itemsFoundOnPage = 0;
 
-                // --- FIX: Target the specific class identified in logs ---
+                // Target the specific class found in previous debug session
                 $('.jrResourceTitle').each((i, el) => {
+                    // Check strict limit inside loop to stop exactly at 300
+                    if (allItems.length >= MAX_ITEMS) {
+                        keepFetching = false;
+                        return false; 
+                    }
+
                     const rawTitle = $(el).text().trim();
-                    
                     const hasYear = /\b(19|20)\d{2}\b/.test(rawTitle);
                     const hasQuality = /WEB|1080p|2160p|DVDRip|BluRay|HDRip|H\.264|H\.265/i.test(rawTitle);
 
                     if (hasYear && hasQuality) {
-                        // Use existing traversal logic to find the date
                         let container = $(el).parent();
                         let dateText = null;
                         
@@ -105,20 +117,14 @@ async function scrapePages() {
                         for (let k = 0; k < 4; k++) {
                             const textToCheck = container.text();
                             const match = textToCheck.match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
-                            if (match) {
-                                dateText = match;
-                                break;
-                            }
-                            // Also try finding it in siblings
+                            if (match) { dateText = match; break; }
+                            
                             const siblingMatch = container.nextAll().text().match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
-                            if (siblingMatch) {
-                                dateText = siblingMatch;
-                                break;
-                            }
+                            if (siblingMatch) { dateText = siblingMatch; break; }
+                            
                             container = container.parent();
                         }
                         
-                        // Fallback: nearby HTML scan
                         if (!dateText) {
                              const nearHtml = $(el).parent().html() || "";
                              dateText = nearHtml.match(/([A-Za-z]{3}\s\d{1,2},\s\d{4})/);
@@ -132,9 +138,7 @@ async function scrapePages() {
                             
                             if (!alreadyAdded) {
                                 if (dateTs < cutoffDate) {
-                                    // Don't break immediately, just stop processing this one, 
-                                    // in case newer items are mixed with older ones (unlikely but safe)
-                                    // Actually, for pagination, usually safe to stop.
+                                    console.log(`> Reached time limit: ${dateStr}`);
                                     keepFetching = false;
                                     return false; 
                                 }
@@ -149,8 +153,15 @@ async function scrapePages() {
 
                 if (itemsFoundOnPage === 0 && page > 1) keepFetching = false;
                 page++;
-                if (keepFetching) await delay(2000);
-                if (page > 10) keepFetching = false;
+                
+                // Safety sleep to avoid hammering the server
+                if (keepFetching) await delay(1500); 
+                
+                // Increased safety page limit from 10 to 35
+                if (page > 35) {
+                    console.log("> Reached page safety limit (35). Stopping.");
+                    keepFetching = false;
+                }
 
             } catch (err) {
                 console.error(`Error fetching page ${page}: ${err.message}`);
@@ -187,6 +198,7 @@ async function scrapePages() {
             }
         }
 
+        // Deduplicate by ID
         const uniqueCatalog = [];
         const seenIds = new Set();
         for (const item of newCatalog) {
@@ -213,13 +225,14 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
                 id: 'tt_status',
                 type: 'movie',
                 name: `Status: ${lastStatus}`,
-                description: "Please wait for the server to fetch data.",
+                description: "The addon is currently fetching data. Please wait.",
                 poster: 'https://via.placeholder.com/300x450.png?text=Loading...',
             }]
         };
     }
     if (type === 'movie' && id === 'wyw_reports') {
         const skip = extra.skip ? parseInt(extra.skip) : 0;
+        // Stremio loads in chunks of 100
         return { metas: movieCatalog.slice(skip, skip + 100) };
     }
     return { metas: [] };
@@ -227,5 +240,6 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 
 serveHTTP(builder.getInterface(), { port: PORT });
 scrapePages();
-setInterval(scrapePages, 120 * 60 * 1000); 
+// Refresh every 3 hours (180 mins) since we are fetching more data now
+setInterval(scrapePages, 180 * 60 * 1000); 
 console.log(`Addon running on http://localhost:${PORT}`);
