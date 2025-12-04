@@ -6,7 +6,7 @@ const cheerio = require('cheerio');
 const PORT = process.env.PORT || 7000;
 const BASE_URL = 'https://whereyouwatch.com/latest-reports/';
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
-const OMDB_API_KEY = 'YOUR_OMDB_KEY_HERE'; // <--- GET FREE KEY AT omdbapi.com
+const OMDB_API_KEY = 'a8924bd9'; // <--- GET FREE KEY AT omdbapi.com
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
 // SETTINGS
