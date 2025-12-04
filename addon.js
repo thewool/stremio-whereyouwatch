@@ -10,7 +10,7 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 
 // --- NEW: OMDB API KEY ---
 // Get a free key at https://www.omdbapi.com/apikey.aspx
-const OMDB_API_KEY = ''; // <--- PASTE YOUR KEY HERE
+const OMDB_API_KEY = 'a8924bd9'; // <--- PASTE YOUR KEY HERE
 
 // INCREASED LIMITS: 
 // 120 days (approx 4 months) to ensure we get 300 items even if they are old
