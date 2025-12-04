@@ -13,7 +13,7 @@ const MAX_AGE_MS = 60 * 24 * 60 * 60 * 1000;
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.0.3', // Bumped version for tracking
+    version: '1.0.4', 
     name: 'WhereYouWatch Reports',
     description: 'Latest releases from WhereYouWatch.com (Last 2 Months)',
     resources: ['catalog'],
@@ -87,50 +87,67 @@ async function scrapePages() {
                 
                 const $ = cheerio.load(response.data);
                 
+                // --- DIAGNOSTIC MODE ---
                 if (page === 1) {
-                    const pageTitle = $('title').text().trim();
-                    console.log(`> [DEBUG] Page Title: "${pageTitle}"`);
-                    const links = $('a').length;
-                    console.log(`> [DEBUG] Total Links found: ${links}`);
-                }
-                
-                let itemsFoundOnPage = 0;
-                let debugLinkCounter = 0;
+                    const html = response.data;
+                    const has1080p = html.includes('1080p');
+                    const has2024 = html.includes('2024') || html.includes('2025');
 
+                    console.log(`> [DEBUG] HTML Check: Contains '1080p'? ${has1080p}`);
+                    console.log(`> [DEBUG] HTML Check: Contains '2024/2025'? ${has2024}`);
+
+                    if (!has1080p && !has2024) {
+                        console.error("> [CRITICAL] Keywords missing. The site likely uses JavaScript to load content. Puppeteer may be required.");
+                    } else if (has1080p) {
+                        console.log("> [DEBUG] Finding element containing '1080p'...");
+                        // Find the deepest element containing "1080p"
+                        $('*').each((i, el) => {
+                            if ($(el).children().length === 0 && $(el).text().includes('1080p')) {
+                                console.log(`> [DEBUG] MAGIC TRACER (Tag): <${el.tagName}>`);
+                                console.log(`> [DEBUG] MAGIC TRACER (Class): "${$(el).attr('class')}"`);
+                                console.log(`> [DEBUG] MAGIC TRACER (Text): "${$(el).text().substring(0, 100)}..."`);
+                                console.log(`> [DEBUG] MAGIC TRACER (Parent): <${$(el).parent().get(0).tagName}> class="${$(el).parent().attr('class')}"`);
+                                return false; // Stop after first match
+                            }
+                        });
+                    }
+
+                    // Dump ANY link that has a year, regardless of quality
+                    let debugYearCount = 0;
+                    $('a').each((i, el) => {
+                        const txt = $(el).text().trim();
+                        if (/\b(19|20)\d{2}\b/.test(txt) && debugYearCount < 5) {
+                            console.log(`> [DEBUG] Potential Movie Link: "${txt}"`);
+                            debugYearCount++;
+                        }
+                    });
+                }
+                // -----------------------
+
+                let itemsFoundOnPage = 0;
+
+                // Broadened selector: Try finding ANY element with the quality patterns if 'a' tags fail
+                // For now, stick to 'a' but log if we are failing
                 $('a').each((i, el) => {
                     const rawTitle = $(el).text().trim();
                     
-                    // --- NEW DEBUGGING LOGIC ---
-                    // Print the first 15 links found to see what we are dealing with
-                    if (page === 1 && debugLinkCounter < 15 && rawTitle.length > 0) {
-                        console.log(`> [DEBUG] Link: "${rawTitle}"`);
-                        debugLinkCounter++;
-                    }
-                    // ---------------------------
-
-                    // Filter: Must have a Year (19xx or 20xx)
                     const hasYear = /\b(19|20)\d{2}\b/.test(rawTitle);
-                    
-                    // Filter: Must look like a release (Quality or source indicator)
+                    // Standard scene release patterns
                     const hasQuality = /WEB|1080p|2160p|DVDRip|BluRay|HDRip|H\.264|H\.265/i.test(rawTitle);
 
                     if (hasYear && hasQuality) {
+                        // ... existing date logic ...
                         let container = $(el).parent();
                         let dateText = null;
                         
-                        // Look up to 3 levels up for the "Submitted on" text
-                        for (let k = 0; k < 3; k++) {
+                        for (let k = 0; k < 4; k++) {
                             const textToCheck = container.text();
                             const match = textToCheck.match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
-                            if (match) {
-                                dateText = match;
-                                break;
-                            }
+                            if (match) { dateText = match; break; }
+                            
                             const siblingMatch = container.nextAll().text().match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
-                            if (siblingMatch) {
-                                dateText = siblingMatch;
-                                break;
-                            }
+                            if (siblingMatch) { dateText = siblingMatch; break; }
+
                             container = container.parent();
                         }
                         
@@ -144,10 +161,8 @@ async function scrapePages() {
                             const dateTs = parseDate(dateStr);
                             
                             const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
-                            
                             if (!alreadyAdded) {
                                 if (dateTs < cutoffDate) {
-                                    console.log(`> Reached limit: ${dateStr}`);
                                     keepFetching = false;
                                     return false; 
                                 }
@@ -226,7 +241,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
                 id: 'tt_status',
                 type: 'movie',
                 name: `Status: ${lastStatus}`,
-                description: "Please wait for the server to fetch data. Check server logs if this persists.",
+                description: "Check Render logs to debug the scraper.",
                 poster: 'https://via.placeholder.com/300x450.png?text=Loading...',
             }]
         };
