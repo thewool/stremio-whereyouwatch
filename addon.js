@@ -8,14 +8,12 @@ const BASE_URL = 'https://whereyouwatch.com/latest-reports/';
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/catalog/movie/top';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36';
 
-// INCREASED LIMITS: 
-// 120 days (approx 4 months) to ensure we get 300 items even if they are old
-const MAX_AGE_MS = 120 * 24 * 60 * 60 * 1000; 
-const MAX_ITEMS = 300;
+// SETTINGS
+const TARGET_PAGE_COUNT = 15; // FORCE scraper to read this many pages
 
 const manifest = {
     id: 'org.whereyouwatch.reports',
-    version: '1.0.6', 
+    version: '1.0.8', 
     name: 'WhereYouWatch Reports',
     description: 'Latest releases from WhereYouWatch.com',
     resources: ['catalog'],
@@ -47,12 +45,6 @@ function parseReleaseTitle(rawString) {
     return { title: rawString, year: null };
 }
 
-function parseDate(dateString) {
-    if (!dateString) return Date.now();
-    const cleanDate = dateString.replace('Submitted on:', '').trim();
-    return new Date(cleanDate).getTime();
-}
-
 async function resolveToImdb(title, year) {
     if (!year) return null;
     try {
@@ -67,109 +59,58 @@ async function resolveToImdb(title, year) {
 }
 
 async function scrapePages() {
-    console.log('--- STARTING SCRAPE (WhereYouWatch) ---');
-    lastStatus = "Scraping Page 1...";
+    console.log('--- STARTING SCRAPE (WhereYouWatch) - FORCED MODE ---');
+    lastStatus = "Scraping...";
     let allItems = [];
-    let keepFetching = true;
     let page = 1;
-    const cutoffDate = Date.now() - MAX_AGE_MS;
 
     try {
-        while (keepFetching) {
-            // Stop if we have enough items
-            if (allItems.length >= MAX_ITEMS) {
-                console.log(`> Reached target of ${MAX_ITEMS} items. Stopping.`);
-                break;
-            }
-
-            console.log(`> Fetching Page ${page}... (Current Count: ${allItems.length})`);
+        // FORCE loop to run for TARGET_PAGE_COUNT, ignoring errors or empty pages
+        while (page <= TARGET_PAGE_COUNT) {
+            console.log(`> Fetching Page ${page}... (Current Total: ${allItems.length})`);
             const url = page === 1 ? BASE_URL : `${BASE_URL}page/${page}/`;
             
             try {
                 const response = await axios.get(url, { 
-                    headers: { 
-                        'User-Agent': USER_AGENT,
-                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                        'Accept-Language': 'en-US,en;q=0.9'
-                    } 
+                    headers: { 'User-Agent': USER_AGENT } 
                 });
                 
                 const $ = cheerio.load(response.data);
                 let itemsFoundOnPage = 0;
 
-                // Target the specific class found in previous debug session
-                $('.jrResourceTitle').each((i, el) => {
-                    // Check strict limit inside loop to stop exactly at 300
-                    if (allItems.length >= MAX_ITEMS) {
-                        keepFetching = false;
-                        return false; 
-                    }
-
+                // AGGRESSIVE SELECTOR: jrResourceTitle is the specific one, others are fallbacks
+                $('.jrResourceTitle, .jrListingTitle, td strong').each((i, el) => {
                     const rawTitle = $(el).text().trim();
+                    
+                    // Simple Validation: Must contain a year
                     const hasYear = /\b(19|20)\d{2}\b/.test(rawTitle);
-                    const hasQuality = /WEB|1080p|2160p|DVDRip|BluRay|HDRip|H\.264|H\.265/i.test(rawTitle);
+                    const isLongEnough = rawTitle.length > 5;
 
-                    if (hasYear && hasQuality) {
-                        let container = $(el).parent();
-                        let dateText = null;
-                        
-                        // Look up to 4 levels up for the "Submitted on" text
-                        for (let k = 0; k < 4; k++) {
-                            const textToCheck = container.text();
-                            const match = textToCheck.match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
-                            if (match) { dateText = match; break; }
-                            
-                            const siblingMatch = container.nextAll().text().match(/Submitted on:\s*([A-Za-z]+\s\d{1,2},\s\d{4})/);
-                            if (siblingMatch) { dateText = siblingMatch; break; }
-                            
-                            container = container.parent();
-                        }
-                        
-                        if (!dateText) {
-                             const nearHtml = $(el).parent().html() || "";
-                             dateText = nearHtml.match(/([A-Za-z]{3}\s\d{1,2},\s\d{4})/);
-                        }
-
-                        if (dateText) {
-                            const dateStr = Array.isArray(dateText) ? dateText[1] : dateText;
-                            const dateTs = parseDate(dateStr);
-                            
-                            const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
-                            
-                            if (!alreadyAdded) {
-                                if (dateTs < cutoffDate) {
-                                    console.log(`> Reached time limit: ${dateStr}`);
-                                    keepFetching = false;
-                                    return false; 
-                                }
-                                itemsFoundOnPage++;
-                                allItems.push({ rawTitle: rawTitle, date: dateTs });
-                            }
+                    if (hasYear && isLongEnough) {
+                        const alreadyAdded = allItems.some(item => item.rawTitle === rawTitle);
+                        if (!alreadyAdded) {
+                            itemsFoundOnPage++;
+                            // We aren't filtering by date anymore to ensure we get results
+                            allItems.push({ rawTitle: rawTitle });
                         }
                     }
                 });
 
-                console.log(`> Page ${page}: Found ${itemsFoundOnPage} valid items.`);
+                console.log(`> Page ${page}: Found ${itemsFoundOnPage} items.`);
 
-                if (itemsFoundOnPage === 0 && page > 1) keepFetching = false;
-                page++;
-                
-                // Safety sleep to avoid hammering the server
-                if (keepFetching) await delay(1500); 
-                
-                // Increased safety page limit from 10 to 35
-                if (page > 35) {
-                    console.log("> Reached page safety limit (35). Stopping.");
-                    keepFetching = false;
-                }
+                // removed the "if items == 0 then stop" logic. 
+                // We keep going just in case Page 2 is weird but Page 3 is fine.
 
             } catch (err) {
                 console.error(`Error fetching page ${page}: ${err.message}`);
-                keepFetching = false;
+                // Don't stop on error, just try next page
             }
+
+            page++;
+            await delay(1000); // 1 second pause between pages
         }
 
-        console.log(`> Found ${allItems.length} reports. Matching IMDb...`);
+        console.log(`> Found ${allItems.length} reports total. Matching IMDb...`);
         lastStatus = `Processing ${allItems.length} items...`;
         const newCatalog = [];
 
@@ -198,7 +139,7 @@ async function scrapePages() {
             }
         }
 
-        // Deduplicate by ID
+        // Deduplicate
         const uniqueCatalog = [];
         const seenIds = new Set();
         for (const item of newCatalog) {
@@ -232,7 +173,6 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
     if (type === 'movie' && id === 'wyw_reports') {
         const skip = extra.skip ? parseInt(extra.skip) : 0;
-        // Stremio loads in chunks of 100
         return { metas: movieCatalog.slice(skip, skip + 100) };
     }
     return { metas: [] };
@@ -240,6 +180,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 
 serveHTTP(builder.getInterface(), { port: PORT });
 scrapePages();
-// Refresh every 3 hours (180 mins) since we are fetching more data now
 setInterval(scrapePages, 180 * 60 * 1000); 
 console.log(`Addon running on http://localhost:${PORT}`);
+
+
