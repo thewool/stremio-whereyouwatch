@@ -18,7 +18,7 @@ const TARGET_PAGE_COUNT = 30;
 
 const manifest = {
     id: 'org.whereyouwatch.reports.rt',
-    version: '1.2.7', 
+    version: '1.2.8', 
     name: 'WhereYouWatch + Ratings',
     description: 'Latest releases with cached RT/IMDb/Metacritic',
     resources: ['catalog'],
@@ -62,6 +62,64 @@ function saveCache() {
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+// --- 1. OMDB Fetcher (Primary & Reliable) ---
+async function fetchScoresFromOmdb(imdbId) {
+    // Check Cache First
+    if (ratingsCache[imdbId]) return ratingsCache[imdbId];
+    if (!imdbId) return null;
+
+    try {
+        const url = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&i=${imdbId}`;
+        const { data } = await axios.get(url);
+
+        if (data && data.Response === 'True') {
+            let result = null;
+
+            // Prioritize Rotten Tomatoes
+            if (data.Ratings) {
+                const rt = data.Ratings.find(r => r.Source === "Rotten Tomatoes");
+                if (rt) result = { type: 'RT', value: rt.Value };
+            }
+
+            // Fallbacks
+            if (!result && data.Metascore && data.Metascore !== "N/A") result = { type: 'Meta', value: data.Metascore };
+            if (!result && data.imdbRating && data.imdbRating !== "N/A") result = { type: 'IMDb', value: data.imdbRating };
+
+            if (result) {
+                console.log(`> 🍅 OMDB Hit for ${imdbId}: ${result.value}`);
+                ratingsCache[imdbId] = result; // Save to cache
+                return result;
+            }
+        }
+    } catch (e) {
+        // console.log(`! OMDB Error: ${e.message}`);
+    }
+    return null;
+}
+
+// --- 2. RT Direct Fetcher (Fallback - HTML Scraping) ---
+async function fetchRottenTomatoesFallback(title, year) {
+    try {
+        const query = year ? `${title} ${year}` : title;
+        // Search page often returns a list of movies
+        const url = `https://www.rottentomatoes.com/search?search=${encodeURIComponent(query)}`;
+        const { data } = await axios.get(url, { 
+            headers: { 'User-Agent': USER_AGENT } 
+        });
+
+        // Loose regex to find the score in the search results HTML
+        // Looks for "tomatometerscore="88"" or similar attributes
+        const scoreMatch = data.match(/tomatometerscore="(\d+)"/i);
+        if (scoreMatch && scoreMatch[1]) {
+            console.log(`> 🍅 Scrape Hit for "${title}": ${scoreMatch[1]}%`);
+            return { type: 'RT', value: `${scoreMatch[1]}%`, source: 'Scrape' };
+        }
+    } catch (e) {
+        console.log(`! RT Scrape Error for "${title}": ${e.message}`);
+    }
+    return null;
+}
+
 function parseReleaseTitle(rawString) {
     const yearMatch = rawString.match(/(19|20)\d{2}/);
     if (yearMatch) {
@@ -74,46 +132,6 @@ function parseReleaseTitle(rawString) {
     }
     let cleanTitle = rawString.replace(/[\._]/g, ' ').trim();
     return { title: cleanTitle, year: null };
-}
-
-// --- NEW: ROBUST ROTTEN TOMATOES FETCH ---
-async function fetchRottenTomatoesDirect(title, year) {
-    try {
-        // Strategy: Try searching just the Title first. 
-        // If that fails (e.g. "Troll 2" returns the 1990 movie), try "Title Year" ("Troll 2 2025")
-        let searchQueries = [title];
-        if (year) searchQueries.push(`${title} ${year}`);
-
-        for (const query of searchQueries) {
-            // console.log(`> 🍅 RT Search: "${query}"...`);
-            const url = `https://www.rottentomatoes.com/napi/search/all?query=${encodeURIComponent(query)}&limit=10`;
-            const { data } = await axios.get(url, { 
-                headers: { 'User-Agent': USER_AGENT } 
-            });
-
-            if (data && data.movie && data.movie.items && data.movie.items.length > 0) {
-                const match = data.movie.items.find(m => {
-                    if (year && m.releaseYear) {
-                        const diff = Math.abs(parseInt(m.releaseYear) - parseInt(year));
-                        return diff <= 1; // Allow 2024/2025 variance
-                    }
-                    return true;
-                });
-
-                if (match && match.tomatometerScore && match.tomatometerScore.score) {
-                    return {
-                        type: 'RT',
-                        value: `${match.tomatometerScore.score}%`,
-                        source: 'Direct'
-                    };
-                }
-            }
-            await delay(200); // Be polite between retries
-        }
-    } catch (e) {
-        // console.error(`! RT Direct Error: ${e.message}`);
-    }
-    return null;
 }
 
 // Helper: Try to resolve movie via OMDB directly if Cinemeta fails
@@ -149,17 +167,6 @@ async function resolveViaOmdb(title, year) {
         }
 
         if (data && data.Response === 'True' && data.imdbID) {
-            // Cache ratings if found
-            let result = null;
-            if (data.Ratings) {
-                const rt = data.Ratings.find(r => r.Source === "Rotten Tomatoes");
-                if (rt) result = { type: 'RT', value: rt.Value };
-            }
-            if (!result && data.Metascore && data.Metascore !== "N/A") result = { type: 'Meta', value: data.Metascore };
-            if (!result && data.imdbRating && data.imdbRating !== "N/A") result = { type: 'IMDb', value: data.imdbRating };
-
-            if (result) ratingsCache[data.imdbID] = result;
-
             return {
                 id: data.imdbID,
                 name: data.Title,
@@ -170,31 +177,6 @@ async function resolveViaOmdb(title, year) {
         }
     } catch(e) {}
     return null;
-}
-
-// Helper to fetch Scores from OMDB (RT -> Metacritic -> IMDb)
-async function getRating(imdbId) {
-    if (ratingsCache[imdbId]) return ratingsCache[imdbId];
-    if (!OMDB_API_KEY || OMDB_API_KEY.includes('YOUR_OMDB')) return null;
-
-    try {
-        const url = `http://www.omdbapi.com/?apikey=${OMDB_API_KEY}&i=${imdbId}`;
-        const { data } = await axios.get(url);
-        
-        if (!data || data.Response === 'False') return null;
-
-        let result = null;
-        if (data.Ratings) {
-            const rt = data.Ratings.find(r => r.Source === "Rotten Tomatoes");
-            if (rt) result = { type: 'RT', value: rt.Value };
-        }
-        if (!result && data.Metascore && data.Metascore !== "N/A") result = { type: 'Meta', value: data.Metascore };
-        if (!result && data.imdbRating && data.imdbRating !== "N/A") result = { type: 'IMDb', value: data.imdbRating };
-
-        if (result) ratingsCache[imdbId] = result;
-        return result;
-
-    } catch (e) { return null; }
 }
 
 async function resolveToImdb(title, year) {
@@ -219,7 +201,7 @@ async function resolveToImdb(title, year) {
 }
 
 async function scrapePages() {
-    console.log('--- STARTING SCRAPE (v1.2.7) ---');
+    console.log('--- STARTING SCRAPE (v1.2.8) ---');
     lastStatus = "Scraping...";
     let allItems = [];
     let page = 1;
@@ -272,14 +254,15 @@ async function scrapePages() {
             }
 
             if (imdbItem) {
-                // 1. Get OMDB Rating
-                let ratingData = await getRating(imdbItem.id);
+                // 1. Get Score (OMDB First, then Fallback)
+                let ratingData = await fetchScoresFromOmdb(imdbItem.id);
                 
-                // 2. If OMDB has no RT score, try Direct RT Fetch
+                // 2. If OMDB failed to get RT score, try Direct HTML Fallback
                 if (!ratingData || ratingData.type !== 'RT') {
-                    const rtDirect = await fetchRottenTomatoesDirect(parsed.title, parsed.year);
+                    const rtDirect = await fetchRottenTomatoesFallback(parsed.title, parsed.year);
                     if (rtDirect) {
                         ratingData = rtDirect;
+                        // Cache explicitly since we bypassed standard OMDB
                         ratingsCache[imdbItem.id] = rtDirect; 
                     }
                 }
